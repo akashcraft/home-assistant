@@ -2,3 +2,4 @@ pygame
 numpy
 soundfile
 librosa
+govee-python
