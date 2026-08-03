@@ -42,7 +42,7 @@ All devices need LAN control enabled in the Govee Home app.
 
 ### System dependencies (Debian)
 ```
-sudo apt update && sudo apt-get install git python3-venv ffmpeg libsndfile1
+sudo apt update && sudo apt-get install git npm python3-venv ffmpeg libsndfile1
 ```
 
 ### Backend
