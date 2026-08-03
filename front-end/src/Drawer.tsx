@@ -12,7 +12,7 @@ import {
   Typography,
 } from '@mui/material'
 import { CloseRounded } from '@mui/icons-material'
-import type { Bulb } from './App'
+import { API_BASE_URL, type Bulb } from './App'
 
 type DrawerProps = {
   open: boolean
@@ -40,8 +40,6 @@ const MAIN_LIGHT_ID = 1
 // Keep this list in sync with engine/led_patterns.py ZONES + server.py STRIP_ZONES.
 const STRIP_SEGMENTS = ['All', 'Table', 'Bed', 'Kitchen', 'Main', 'Final'] as const
 type StripSegment = (typeof STRIP_SEGMENTS)[number]
-
-const API_BASE_URL = 'http://192.168.2.27:8080'
 
 async function postStripSegments(segments: StripSegment[], color: string) {
   try {

@@ -8,3 +8,4 @@ engine/bulb_states.json
 bulb_state.json
 .DS_Store
 music/*
+gateway-toggle.md

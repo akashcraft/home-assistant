@@ -71,8 +71,8 @@ It listens on `0.0.0.0:8080` (HTTP + Socket.IO).
 ### Frontend
 ```
 cd front-end
-npm ci
-npm run dev
+npm install
+npx vite --host
 ```
 For a production deploy, `npm run build` and serve the `dist/` folder from any static host - or point `send_from_directory` in `server.py` at it and serve from one process.
 
