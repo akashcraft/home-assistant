@@ -1,0 +1,6 @@
+__pycache__/
+.conda/
+.pydeps/
+.vscode/
+engine/__pycache__/
+bulb_state.json

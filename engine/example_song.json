@@ -1,0 +1,66 @@
+{
+  "events": [
+    { "pattern": "fade", "start_ms": 0, "end_ms": 5000,
+      "segments": "all", "color": [255, 255, 255],
+      "params": { "mode": "in" } },
+
+    { "pattern": "rainbow", "start_ms": 5000, "end_ms": 13000,
+      "segments": "all", "color": [255, 255, 255],
+      "params": { "speed": 1.0 } },
+
+    { "pattern": "beats", "start_ms": 13000, "end_ms": 13400,
+      "segments": "Table", "color": [255, 30, 30], "params": { "attack_ms": 40 } },
+
+    { "pattern": "beats", "start_ms": 13700, "end_ms": 14100,
+      "segments": "Table", "color": [255, 30, 30], "params": { "attack_ms": 40 } },
+
+    { "pattern": "beats", "start_ms": 14400, "end_ms": 14800,
+      "segments": "Table", "color": [255, 30, 30], "params": { "attack_ms": 40 } },
+
+    { "pattern": "sparkle", "start_ms": 15000, "end_ms": 23000,
+      "segments": "Final", "color": [180, 210, 255], "params": { "density": 0.25 } },
+
+    { "pattern": "snake", "start_ms": 23000, "end_ms": 32000,
+      "segments": "all", "color": [0, 255, 130],
+      "params": { "length": 8, "passes": 2 } },
+
+    { "pattern": "criss_cross", "start_ms": 32000, "end_ms": 41000,
+      "segments": "Kitchen, Main", "color": [255, 0, 90],
+      "params": { "color_b": [0, 160, 255], "passes": 3 } },
+
+    { "pattern": "alt_band", "start_ms": 41000, "end_ms": 49000,
+      "segments": "all", "color": [255, 150, 0],
+      "params": { "band_size": 3, "speed": 6 } },
+
+    { "pattern": "pulse", "start_ms": 49000, "end_ms": 57000,
+      "segments": "Bed", "color": [0, 220, 255], "params": { "cycles": 4 } },
+
+    { "pattern": "bounce", "start_ms": 57000, "end_ms": 65000,
+      "segments": "Table, Bed", "color": [255, 255, 0], "params": { "passes": 4, "trail": 5 } },
+
+    { "pattern": "comet", "start_ms": 65000, "end_ms": 75000,
+      "segments": "all", "color": [255, 60, 255], "params": { "length": 7, "passes": 3 } },
+
+    { "pattern": "twinkle_fade", "start_ms": 75000, "end_ms": 84000,
+      "segments": "all", "color": [255, 200, 140], "params": { "spawn_chance": 0.05, "fade_ms": 700 } },
+
+    { "pattern": "scramble", "start_ms": 84000, "end_ms": 93000,
+      "segments": "all", "color": [255, 0, 0],
+      "params": { "interval_ms": 130, "colors": [[255,0,0],[0,255,0],[0,0,255],[255,255,0]] } },
+
+    { "pattern": "hold", "start_ms": 93000, "end_ms": 98000,
+      "segments": "Main", "color": [255, 0, 60], "params": {} },
+
+    { "pattern": "stack", "start_ms": 98000, "end_ms": 106000,
+      "segments": "Final", "color": [255, 255, 255], "params": {} },
+
+    { "pattern": "rainbow_jump", "start_ms": 106000, "end_ms": 115000,
+      "segments": "all", "color": [255, 255, 255], "params": { "steps": 8 } },
+
+    { "pattern": "audio_spectrum", "start_ms": 115000, "end_ms": 130000,
+      "segments": "all", "color": [255, 255, 255], "params": { "sensitivity": 25, "rainbow": true } },
+
+    { "pattern": "fade", "start_ms": 130000, "end_ms": 135000,
+      "segments": "all", "color": [255, 255, 255], "params": { "mode": "out" } }
+  ]
+}
