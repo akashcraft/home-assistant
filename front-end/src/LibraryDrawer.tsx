@@ -39,6 +39,8 @@ type LibraryDrawerProps = {
   isPhone: boolean
   tracks: MusicTrack[]
   playing: string | null
+  /** True when another browser owns playback -- disable play buttons here. */
+  disablePlayback?: boolean
   linkToLights: boolean
   onLinkToLightsChange: (next: boolean) => void
   artUrl: (basename: string) => string
@@ -54,6 +56,7 @@ function LibraryDrawer({
   isPhone,
   tracks,
   playing,
+  disablePlayback,
   linkToLights,
   onLinkToLightsChange,
   artUrl,
@@ -387,11 +390,13 @@ function LibraryDrawer({
                       <IconButton
                         size="small"
                         aria-label={isPlaying ? 'Stop' : 'Play'}
+                        disabled={!isPlaying && !!disablePlayback}
                         onClick={() => (isPlaying ? onStop() : onPlay(track.basename))}
                         sx={{
                           color: '#ffffff',
                           backgroundColor: alpha('#ffffff', 0.08),
                           ':hover': { backgroundColor: alpha('#ffffff', 0.16) },
+                          '&.Mui-disabled': { color: 'rgba(255,255,255,0.3)' },
                         }}
                       >
                         {isPlaying ? <StopRounded fontSize="small" /> : <PlayArrowRounded fontSize="small" />}

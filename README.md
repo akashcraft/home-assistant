@@ -60,6 +60,14 @@ python server.py
 ```
 It listens on `0.0.0.0:8080` (HTTP + Socket.IO).
 
+> [!NOTE]
+> `govee-python` adds a 0.5 s "verification" delay after every LAN command, which makes routines feel sluggish and can starve the LED-sync loop. In the installed package, set `DEFAULT_VERIFICATION_DELAY = 0` (and `DEFAULT_VERIFICATION_RETRY_DELAY = 0` where present) in each of `power.py`, `brightness.py`, and `color.py`:
+> ```
+> .venv/lib/python3.12/site-packages/govee/api/lan/power.py
+> .venv/lib/python3.12/site-packages/govee/api/lan/brightness.py
+> .venv/lib/python3.12/site-packages/govee/api/lan/color.py
+> ```
+
 ### Frontend
 ```
 cd front-end

@@ -332,10 +332,13 @@ AUDIO_EXTS = {".mp3", ".wav", ".m4a", ".flac", ".ogg"}
 
 
 class MusicPlayback:
-    """Currently-running music process, if any. Only one plays at a time."""
+    """Currently-running music process, if any. Only one plays at a time,
+    controlled by exactly one browser -- the owner. Other browsers can
+    watch the state but cannot start/stop while this one holds control."""
     process = None  # subprocess.Popen
     basename = None
     linked = False
+    owner = None  # opaque client id string sent by the browser
     lock = Lock()
 
 
@@ -369,6 +372,7 @@ def _music_broadcast():
         payload = {
             "playing": music_state.basename,
             "linked": music_state.linked,
+            "owner": music_state.owner,
         }
     socketio.emit("music_updated", payload)
 
@@ -397,6 +401,7 @@ def _music_kill_locked():
     music_state.process = None
     music_state.basename = None
     music_state.linked = False
+    music_state.owner = None
     # led_player sends razer control(False) in its finally block, so the
     # strip is back in govee mode. Sync our flags so subsequent user actions
     # take the govee path immediately without stale razer state.
@@ -434,6 +439,7 @@ def _music_watchdog(proc, basename: str):
             music_state.process = None
             music_state.basename = None
             music_state.linked = False
+            music_state.owner = None
             emit_after = True
         else:
             emit_after = False
@@ -836,8 +842,27 @@ def get_music_art(basename):
     return send_from_directory(str(MUSIC_DIR), f"{safe}.png")
 
 
+@app.route('/api/music/<basename>/stream', methods=['GET', 'OPTIONS'])
+def stream_music(basename):
+    """Serve the raw audio file so browsers can play it via <audio>.
+    Flask's send_from_directory handles HTTP Range requests when the client
+    asks for them, so seeking works out of the box."""
+    safe = _safe_basename(basename)
+    audio = _find_audio_file(safe)
+    if audio is None:
+        return jsonify({'error': 'track not found'}), 404
+    return send_from_directory(str(MUSIC_DIR), audio.name, conditional=True)
+
+
 @app.route('/api/music/<basename>/play', methods=['POST', 'OPTIONS'])
 def play_music(basename):
+    """Browser-driven playback: exactly one browser plays audio at a time,
+    identified by an opaque `owner` id it sends in the body. If another
+    browser is currently the owner, this request is refused with 409.
+
+    When 'link_to_lights' is set we also spawn engine/led_renderer.py (no
+    audio, wall-clock synced) to drive the strip + bulbs. Manual CLI
+    testing via engine/led_player.py or engine/play_music.py is unaffected."""
     safe = _safe_basename(basename)
     audio = _find_audio_file(safe)
     if audio is None:
@@ -845,33 +870,60 @@ def play_music(basename):
 
     payload = request.get_json(silent=True) or {}
     link = bool(payload.get('link_to_lights', False))
+    owner = str(payload.get('owner') or '').strip()
+    if not owner:
+        return jsonify({'error': 'missing owner id'}), 400
 
-    if link:
-        json_path = MUSIC_DIR / f"{safe}.json"
-        if not json_path.exists():
-            return jsonify({'error': 'no timeline JSON for this track'}), 400
-        cmd = [sys.executable, str(ENGINE_DIR / "led_player.py"),
-               str(audio), str(json_path)]
-    else:
-        cmd = [sys.executable, str(ENGINE_DIR / "play_music.py"), str(audio)]
+    json_path = MUSIC_DIR / f"{safe}.json"
+    if link and not json_path.exists():
+        return jsonify({'error': 'no timeline JSON for this track'}), 400
 
+    proc = None
     with music_state.lock:
+        # Reject if a different browser owns the current playback.
+        if music_state.owner is not None and music_state.owner != owner:
+            return jsonify({
+                'error': 'music is playing on another device',
+                'playing': music_state.basename,
+                'owner': music_state.owner,
+            }), 409
         _music_kill_locked()
-        try:
-            proc = subprocess.Popen(cmd, cwd=str(ENGINE_DIR))
-        except Exception as e:
-            return jsonify({'error': f'failed to start playback: {e}'}), 500
+        if link:
+            try:
+                proc = subprocess.Popen(
+                    [sys.executable, str(ENGINE_DIR / "led_renderer.py"),
+                     str(audio), str(json_path)],
+                    cwd=str(ENGINE_DIR),
+                )
+            except Exception as e:
+                return jsonify({'error': f'failed to start renderer: {e}'}), 500
         music_state.process = proc
         music_state.basename = safe
         music_state.linked = link
+        music_state.owner = owner
 
-    Thread(target=_music_watchdog, args=(proc, safe), daemon=True).start()
+    if proc is not None:
+        Thread(target=_music_watchdog, args=(proc, safe), daemon=True).start()
+
     _music_broadcast()
-    return jsonify({'playing': safe, 'linked': link})
+    return jsonify({
+        'playing': safe,
+        'linked': link,
+        'owner': owner,
+        'stream_url': f"/api/music/{safe}/stream",
+    })
 
 
 @app.route('/api/music/stop', methods=['POST', 'OPTIONS'])
 def stop_music_endpoint():
+    payload = request.get_json(silent=True) or {}
+    owner = str(payload.get('owner') or '').strip()
+    with music_state.lock:
+        if music_state.owner is not None and music_state.owner != owner:
+            return jsonify({
+                'error': 'not the current owner',
+                'owner': music_state.owner,
+            }), 403
     _music_stop()
     return jsonify({'playing': None})
 

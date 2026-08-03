@@ -15,6 +15,8 @@ export type MusicTrack = {
 type MusicTileProps = {
   track: MusicTrack
   isPlaying: boolean
+  /** Someone else's browser owns playback -- lock this tile out. */
+  disabled?: boolean
   isPhone?: boolean
   artUrl: (basename: string) => string
   onPlay: (basename: string) => void
@@ -24,12 +26,14 @@ type MusicTileProps = {
 function MusicTile({
   track,
   isPlaying,
+  disabled,
   isPhone,
   artUrl,
   onPlay,
   onStop,
 }: MusicTileProps) {
   const artSrc = track.has_art ? artUrl(track.basename) : null
+  const locked = !!disabled && !isPlaying
 
   return (
     <Card
@@ -44,10 +48,12 @@ function MusicTile({
           ? '1px solid rgba(255,255,255,0.35)'
           : '1px solid rgba(255,255,255,0.06)',
         background: 'linear-gradient(180deg, rgba(30,34,42,0.95) 0%, rgba(12,14,18,0.98) 100%)',
-        transition: 'transform 140ms ease, box-shadow 140ms ease, border-color 140ms ease',
+        transition: 'transform 140ms ease, box-shadow 140ms ease, border-color 140ms ease, opacity 140ms ease',
+        opacity: locked ? 0.5 : 1,
+        pointerEvents: locked ? 'none' : 'auto',
 
         ':hover': {
-          cursor: 'pointer',
+          cursor: locked ? 'not-allowed' : 'pointer',
         },
 
         ...(artSrc && {

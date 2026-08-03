@@ -1,4 +1,4 @@
-import { useEffect, useState } from 'react'
+import { useEffect, useRef, useState } from 'react'
 import './App.css'
 import {
   alpha,
@@ -75,7 +75,18 @@ type StripState = {
 type MusicState = {
   playing: string | null
   linked: boolean
+  owner: string | null
 }
+
+// Stable-per-browser id so the server can enforce single-owner playback.
+const CLIENT_ID = (() => {
+  const key = 'client.id'
+  const existing = localStorage.getItem(key)
+  if (existing) return existing
+  const fresh = (crypto.randomUUID?.() ?? `c-${Date.now()}-${Math.random().toString(36).slice(2)}`)
+  localStorage.setItem(key, fresh)
+  return fresh
+})()
 
 const artUrl = (basename: string) =>
   `${API_BASE_URL}/api/music/${encodeURIComponent(basename)}/art`
@@ -90,7 +101,7 @@ function App() {
     zones: [], colors: {}, active: [], on: false,
   })
   const [musicTracks, setMusicTracks] = useState<MusicTrack[]>([])
-  const [musicState, setMusicState] = useState<MusicState>({ playing: null, linked: false })
+  const [musicState, setMusicState] = useState<MusicState>({ playing: null, linked: false, owner: null })
   const [libraryOpen, setLibraryOpen] = useState(false)
   const [linkToLights, setLinkToLights] = useState<boolean>(() => {
     return localStorage.getItem('library.linkToLights') === 'true'
@@ -98,6 +109,10 @@ function App() {
   useEffect(() => {
     localStorage.setItem('library.linkToLights', linkToLights ? 'true' : 'false')
   }, [linkToLights])
+  const audioRef = useRef<HTMLAudioElement | null>(null)
+
+  const isOwner = musicState.owner === CLIENT_ID
+  const isBusyElsewhere = musicState.playing !== null && !isOwner
 
   const selectedBulb = bulbs.find((bulb) => bulb.id === selectedBulbId) ?? bulbs[0]
   const activeBulbs = bulbs.filter((bulb) => bulb.on).length
@@ -157,7 +172,15 @@ function App() {
       setMusicState({
         playing: incoming.playing ?? null,
         linked: !!incoming.linked,
+        owner: incoming.owner ?? null,
       })
+      // Server said nobody is playing (natural end, stop, or someone else
+      // took over) -- silence the local <audio> if it was ours.
+      if (!incoming.playing && audioRef.current) {
+        audioRef.current.pause()
+        audioRef.current.removeAttribute('src')
+        audioRef.current.load()
+      }
     }
 
     socket.on('bulbs_state', applyBulbsState)
@@ -252,15 +275,32 @@ function App() {
   }
 
   const handleMusicPlay = async (basename: string) => {
+    if (isBusyElsewhere) {
+      window.alert('Music is already playing on another device.')
+      return
+    }
     try {
       const res = await fetch(`${API_BASE_URL}/api/music/${encodeURIComponent(basename)}/play`, {
         method: 'POST',
         headers: { 'Content-Type': 'application/json' },
-        body: JSON.stringify({ link_to_lights: linkToLights }),
+        body: JSON.stringify({ link_to_lights: linkToLights, owner: CLIENT_ID }),
       })
       if (!res.ok) {
         const body = await res.json().catch(() => ({}))
         window.alert(`Playback failed: ${body.error ?? res.statusText}`)
+        return
+      }
+      const data = await res.json().catch(() => ({}))
+      // We're the owner now -- kick off the local <audio> so this browser is
+      // the only one making sound.
+      const el = audioRef.current
+      if (el && data.stream_url) {
+        el.src = `${API_BASE_URL}${data.stream_url}`
+        el.load()
+        void el.play().catch(() => {
+          // Autoplay blocked? Unlikely since we're inside a user gesture,
+          // but nothing to do if it is.
+        })
       }
     } catch (err) {
       window.alert(`Playback failed: ${err instanceof Error ? err.message : String(err)}`)
@@ -268,8 +308,14 @@ function App() {
   }
 
   const handleMusicStop = async () => {
+    // Optimistic local pause so the button feels responsive.
+    if (audioRef.current) audioRef.current.pause()
     try {
-      await fetch(`${API_BASE_URL}/api/music/stop`, { method: 'POST' })
+      await fetch(`${API_BASE_URL}/api/music/stop`, {
+        method: 'POST',
+        headers: { 'Content-Type': 'application/json' },
+        body: JSON.stringify({ owner: CLIENT_ID }),
+      })
     } catch {
       // Best-effort; the socket will echo the real state.
     }
@@ -464,6 +510,7 @@ function App() {
                 key={track.basename}
                 track={track}
                 isPlaying={musicState.playing === track.basename}
+                disabled={isBusyElsewhere}
                 isPhone={isPhone}
                 artUrl={artUrl}
                 onPlay={handleMusicPlay}
@@ -478,6 +525,7 @@ function App() {
           isPhone={isPhone}
           tracks={musicTracks}
           playing={musicState.playing}
+          disablePlayback={isBusyElsewhere}
           linkToLights={linkToLights}
           onLinkToLightsChange={setLinkToLights}
           artUrl={artUrl}
@@ -486,6 +534,14 @@ function App() {
           onPlay={handleMusicPlay}
           onStop={handleMusicStop}
           onLibraryChanged={() => void refreshMusicLibrary()}
+        />
+        {/* Global HTML5 audio -- controlled entirely by 'music_play' /
+            'music_updated' socket events so every connected browser plays
+            the same song in near-sync. */}
+        <audio
+          ref={audioRef}
+          preload="auto"
+          onEnded={() => { void handleMusicStop() }}
         />
       </Box >
     </ThemeProvider >
