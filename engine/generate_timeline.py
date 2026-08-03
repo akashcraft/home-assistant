@@ -29,7 +29,8 @@ import argparse
 import json
 import os
 import random
-from typing import List, Optional, Tuple
+import time
+from typing import Dict, List, Optional, Tuple
 
 import librosa
 import numpy as np
@@ -53,6 +54,24 @@ PASTEL_PALETTE = [
 ]
 
 ZONES = ["Table", "Bed", "Kitchen", "Main", "Final"]
+
+# Zone routing for the "special effects" layer. The player renders one event
+# at a time (no layering), so these are targeting choices per event, not
+# simultaneous layers -- rotating them gives the strip a multi-zone feel.
+SPECIAL_ZONES = ["Main, Bed", "Bed", "Main", "Bed, Main, Final", "Main, Kitchen"]
+SPECTRUM_ZONES = ["Table", "Table, Kitchen", "all"]
+
+# Anti-repeat pools per group label. Order-agnostic; we sample without
+# picking the same pattern twice in a row per label.
+BUILDUP_POOL = ["sparkle", "twinkle_fade", "stack", "scramble", "bounce", "comet"]
+VOCAL_POOL = ["pulse", "comet", "criss_cross", "rainbow", "bounce", "twinkle_fade"]
+DROP_ALT_POOL = ["rainbow_jump", "scramble", "stack", "alt_band"]
+FILLER_LOW_POOL = ["hold", "fade", "twinkle_fade", "pulse"]
+FILLER_MED_POOL = ["rainbow", "comet", "snake", "criss_cross", "bounce"]
+FILLER_HIGH_POOL = ["alt_band", "snake", "bounce", "scramble", "rainbow_jump", "comet"]
+
+# Every Nth group is replaced with an audio_spectrum showcase.
+SPECTRUM_EVERY_N_GROUPS = 6
 
 
 def analyze(song_path: str):
@@ -155,94 +174,158 @@ def classify_groups(groups: List[dict]) -> List[dict]:
     return groups
 
 
+def _pick_no_repeat(pool: List[str], last: Optional[str], rng: random.Random) -> str:
+    choices = [p for p in pool if p != last] or pool
+    return rng.choice(choices)
+
+
+def _build_event(pattern: str, start_ms: int, end_ms: int, segments, color,
+                  duration_sec: float, streak: int, rng: random.Random) -> dict:
+    """Build a single event dict with sensible per-pattern params."""
+    params: dict = {}
+    if pattern == "sparkle":
+        density = min(0.6, 0.15 + 0.06 * streak + rng.random() * 0.1)
+        params = {"density": round(density, 2)}
+    elif pattern == "twinkle_fade":
+        params = {
+            "spawn_chance": round(0.03 + rng.random() * 0.06, 3),
+            "fade_ms": rng.choice([400, 600, 800, 1000]),
+        }
+    elif pattern == "stack":
+        params = {}
+    elif pattern == "scramble":
+        params = {
+            "interval_ms": rng.choice([120, 150, 200, 250]),
+            "colors": [color, [255 - color[0], 255 - color[1], 255 - color[2]]],
+        }
+    elif pattern == "bounce":
+        params = {"passes": rng.randint(2, 5), "trail": rng.randint(2, 5)}
+    elif pattern == "comet":
+        params = {"length": rng.randint(4, 8), "passes": rng.randint(1, 3)}
+    elif pattern == "pulse":
+        params = {"cycles": max(1, round(duration_sec / rng.choice([1.5, 2.0, 2.5])))}
+    elif pattern == "criss_cross":
+        params = {
+            "passes": rng.randint(1, 3),
+            "color_b": [255 - color[0], 255 - color[1], 255 - color[2]],
+        }
+    elif pattern == "rainbow":
+        params = {"speed": round(0.5 + rng.random() * 1.0, 2)}
+    elif pattern == "rainbow_jump":
+        params = {"steps": rng.choice([6, 8, 10, 12])}
+    elif pattern == "snake":
+        params = {"length": rng.randint(4, 8), "passes": rng.randint(1, 3)}
+    elif pattern == "alt_band":
+        params = {"band_size": rng.choice([2, 3, 4]), "speed": rng.choice([4, 6, 8, 10])}
+    elif pattern == "hold":
+        params = {}
+    elif pattern == "fade":
+        params = {"mode": rng.choice(["in_out", "in", "out"])}
+    elif pattern == "audio_spectrum":
+        params = {
+            "sensitivity": rng.choice([25.0, 30.0, 40.0]),
+            "rainbow": rng.random() < 0.7,
+        }
+    return {
+        "pattern": pattern, "start_ms": start_ms, "end_ms": end_ms,
+        "segments": segments, "color": list(color), "params": params,
+    }
+
+
 def groups_to_events(groups: List[dict], avg_beat_dur: float, use_zones: bool,
                       rng: random.Random) -> List[dict]:
     events = []
-    zone_cycle_idx = 0
+    last_by_label: Dict[str, Optional[str]] = {
+        "drop": None, "buildup": None, "vocal": None,
+        "filler_low": None, "filler_med": None, "filler_high": None,
+    }
+    special_idx = 0
+    spectrum_idx = 0
 
-    def next_zone():
-        nonlocal zone_cycle_idx
-        z = ZONES[zone_cycle_idx % len(ZONES)]
-        zone_cycle_idx += 1
+    def next_special_zone() -> str:
+        nonlocal special_idx
+        z = SPECIAL_ZONES[special_idx % len(SPECIAL_ZONES)]
+        special_idx += 1
         return z
+
+    def next_spectrum_zone() -> str:
+        nonlocal spectrum_idx
+        z = SPECTRUM_ZONES[spectrum_idx % len(SPECTRUM_ZONES)]
+        spectrum_idx += 1
+        return z
+
+    palette = list(COLOR_PALETTE)
+    rng.shuffle(palette)
 
     for i, g in enumerate(groups):
         start_ms = int(g["start"] * 1000)
         end_ms = int(g["end"] * 1000)
-        color = COLOR_PALETTE[i % len(COLOR_PALETTE)]
+        dur_sec = g["end"] - g["start"]
+        color = palette[i % len(palette)]
+
+        # Periodic audio_spectrum showcase overrides the group's default pattern.
+        # Skips drops so we don't dilute the biggest moments.
+        if (g["label"] != "drop"
+                and i > 0
+                and i % SPECTRUM_EVERY_N_GROUPS == 0):
+            segs = next_spectrum_zone() if use_zones else "all"
+            events.append(_build_event(
+                "audio_spectrum", start_ms, end_ms, segs, color, dur_sec, 0, rng))
+            continue
 
         if g["label"] == "drop":
-            flash_dur = min(0.3, avg_beat_dur * 0.6)
-            for b in g["beats"]:
-                events.append({
-                    "pattern": "beats",
-                    "start_ms": int(b * 1000),
-                    "end_ms": int((b + flash_dur) * 1000),
-                    "segments": "all",
-                    "color": color,
-                    "params": {"attack_ms": 25},
-                })
-            if not g["beats"]:
-                events.append({
-                    "pattern": "alt_band", "start_ms": start_ms, "end_ms": end_ms,
-                    "segments": "all", "color": color,
-                    "params": {"band_size": 3, "speed": 10},
-                })
+            # Beat-flash the strip, but occasionally swap to an alternate
+            # high-impact pattern for variety across drops.
+            use_alt = rng.random() < 0.35 or not g["beats"]
+            if use_alt:
+                pat = _pick_no_repeat(DROP_ALT_POOL, last_by_label["drop"], rng)
+                last_by_label["drop"] = pat
+                events.append(_build_event(
+                    pat, start_ms, end_ms, "all", color, dur_sec, 0, rng))
+            else:
+                flash_dur = min(0.3, avg_beat_dur * 0.6)
+                for b in g["beats"]:
+                    events.append({
+                        "pattern": "beats",
+                        "start_ms": int(b * 1000),
+                        "end_ms": int((b + flash_dur) * 1000),
+                        "segments": "all",
+                        "color": list(color),
+                        "params": {"attack_ms": 25},
+                    })
 
         elif g["label"] == "buildup":
+            pat = _pick_no_repeat(BUILDUP_POOL, last_by_label["buildup"], rng)
+            last_by_label["buildup"] = pat
+            segs = next_special_zone() if use_zones else "all"
             streak = g.get("rise_streak", 1)
-            density = min(0.6, 0.12 + 0.08 * streak)
-            segs = next_zone() if use_zones else "all"
-            events.append({
-                "pattern": "sparkle", "start_ms": start_ms, "end_ms": end_ms,
-                "segments": segs, "color": color,
-                "params": {"density": round(density, 2)},
-            })
+            events.append(_build_event(
+                pat, start_ms, end_ms, segs, color, dur_sec, streak, rng))
 
         elif g["label"] == "vocal":
+            pat = _pick_no_repeat(VOCAL_POOL, last_by_label["vocal"], rng)
+            last_by_label["vocal"] = pat
             pastel = PASTEL_PALETTE[i % len(PASTEL_PALETTE)]
-            segs = next_zone() if use_zones else "all"
-            events.append({
-                "pattern": "pulse", "start_ms": start_ms, "end_ms": end_ms,
-                "segments": segs, "color": pastel,
-                "params": {"cycles": max(1, round((g["end"] - g["start"]) / 2))},
-            })
+            segs = next_special_zone() if use_zones else "all"
+            events.append(_build_event(
+                pat, start_ms, end_ms, segs, pastel, dur_sec, 0, rng))
 
-        else:  # filler, tiered by energy
+        else:  # filler
             tier = g["tier"]
-            segs = next_zone() if use_zones else "all"
             if tier == "low":
-                events.append({
-                    "pattern": "hold", "start_ms": start_ms, "end_ms": end_ms,
-                    "segments": segs, "color": [c // 3 for c in color], "params": {},
-                })
+                pool, key = FILLER_LOW_POOL, "filler_low"
+                use_color = [c // 3 for c in color]
             elif tier == "medium":
-                choice = rng.choice(["rainbow", "comet"])
-                if choice == "rainbow":
-                    events.append({
-                        "pattern": "rainbow", "start_ms": start_ms, "end_ms": end_ms,
-                        "segments": segs, "color": color, "params": {"speed": 0.8},
-                    })
-                else:
-                    events.append({
-                        "pattern": "comet", "start_ms": start_ms, "end_ms": end_ms,
-                        "segments": segs, "color": color,
-                        "params": {"length": 6, "passes": 2},
-                    })
-            else:  # high, but not a full drop
-                choice = rng.choice(["alt_band", "snake"])
-                if choice == "alt_band":
-                    events.append({
-                        "pattern": "alt_band", "start_ms": start_ms, "end_ms": end_ms,
-                        "segments": segs, "color": color,
-                        "params": {"band_size": 3, "speed": 6},
-                    })
-                else:
-                    events.append({
-                        "pattern": "snake", "start_ms": start_ms, "end_ms": end_ms,
-                        "segments": segs, "color": color,
-                        "params": {"length": 6, "passes": 2},
-                    })
+                pool, key = FILLER_MED_POOL, "filler_med"
+                use_color = color
+            else:
+                pool, key = FILLER_HIGH_POOL, "filler_high"
+                use_color = color
+            pat = _pick_no_repeat(pool, last_by_label[key], rng)
+            last_by_label[key] = pat
+            segs = next_special_zone() if use_zones else "all"
+            events.append(_build_event(
+                pat, start_ms, end_ms, segs, use_color, dur_sec, 0, rng))
 
     return events
 
@@ -265,7 +348,9 @@ def add_intro_outro(events: List[dict], duration_sec: float) -> List[dict]:
 
 
 def generate(song_path: str, group_beats: int = DEFAULT_GROUP_BEATS,
-             use_zones: bool = False, seed: int = 42) -> dict:
+             use_zones: bool = False, seed: Optional[int] = None) -> dict:
+    if seed is None:
+        seed = int.from_bytes(os.urandom(4), "big") ^ int(time.time() * 1000)
     rng = random.Random(seed)
     analysis = analyze(song_path)
     groups, avg_beat_dur = build_groups(analysis, group_beats)
@@ -274,6 +359,7 @@ def generate(song_path: str, group_beats: int = DEFAULT_GROUP_BEATS,
     events = add_intro_outro(events, analysis["duration_sec"])
     events.sort(key=lambda e: e["start_ms"])
 
+    print(f"Seed: {seed}")
     print(f"Detected tempo: {analysis['tempo']:.1f} BPM, "
           f"duration: {analysis['duration_sec']:.1f}s, "
           f"{len(groups)} groups -> {len(events)} events")
@@ -281,6 +367,10 @@ def generate(song_path: str, group_beats: int = DEFAULT_GROUP_BEATS,
     for g in groups:
         label_counts[g["label"]] = label_counts.get(g["label"], 0) + 1
     print("Group breakdown:", label_counts)
+    pattern_counts: Dict[str, int] = {}
+    for e in events:
+        pattern_counts[e["pattern"]] = pattern_counts.get(e["pattern"], 0) + 1
+    print("Pattern breakdown:", pattern_counts)
 
     return {"events": events}
 
@@ -293,7 +383,8 @@ if __name__ == "__main__":
                          help="Beats per analysis group (default 4, ~1 bar in 4/4)")
     parser.add_argument("--zones", action="store_true",
                          help="Rotate non-drop events across named zones instead of always 'all'")
-    parser.add_argument("--seed", type=int, default=42, help="Random seed for filler pattern choice")
+    parser.add_argument("--seed", type=int, default=None,
+                         help="Random seed. Omit for a fresh seed each run (default) so no two JSONs match.")
     args = parser.parse_args()
 
     output_path = args.output_path or (os.path.splitext(args.song_path)[0] + ".json")
