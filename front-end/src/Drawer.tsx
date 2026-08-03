@@ -1,9 +1,11 @@
+import { useState } from 'react'
 import {
   alpha,
   Box,
-  ButtonBase,
+  Checkbox,
   Divider,
   Drawer as MuiDrawer,
+  FormControlLabel,
   IconButton,
   Slider,
   Stack,
@@ -16,6 +18,7 @@ type DrawerProps = {
   open: boolean
   isPhone: boolean
   bulb?: Bulb
+  stripActive?: string[]
   onClose: () => void
   onBrightnessChange: (bulbId?: number, brightness?: number) => void
   onColorChange: (bulbId?: number, color?: string) => void
@@ -33,14 +36,132 @@ export const presetColors = [
   { name: 'White', color: '#ffffff' },
 ]
 
+const MAIN_LIGHT_ID = 1
+// Keep this list in sync with engine/led_patterns.py ZONES + server.py STRIP_ZONES.
+const STRIP_SEGMENTS = ['All', 'Table', 'Bed', 'Kitchen', 'Main', 'Final'] as const
+type StripSegment = (typeof STRIP_SEGMENTS)[number]
+
+const API_BASE_URL = 'http://192.168.2.27:8080'
+
+async function postStripSegments(segments: StripSegment[], color: string) {
+  try {
+    await fetch(`${API_BASE_URL}/api/bulbs/${MAIN_LIGHT_ID}/segments`, {
+      method: 'POST',
+      headers: { 'Content-Type': 'application/json' },
+      body: JSON.stringify({ segments, color, exclusive: true }),
+    })
+  } catch {
+    // UI stays responsive even if the server is unreachable.
+  }
+}
+
+async function postMainLightPower(on: boolean) {
+  try {
+    await fetch(`${API_BASE_URL}/api/bulbs/${MAIN_LIGHT_ID}/power`, {
+      method: 'POST',
+      headers: { 'Content-Type': 'application/json' },
+      body: JSON.stringify({ on }),
+    })
+  } catch {
+    // UI stays responsive even if the server is unreachable.
+  }
+}
+
+const INDIVIDUAL_SEGMENTS: StripSegment[] = STRIP_SEGMENTS.filter((s) => s !== 'All')
+
+function deriveSelected(active?: string[]): StripSegment[] {
+  if (!active || active.length === 0) return []
+  const valid = active
+    .map((name) => INDIVIDUAL_SEGMENTS.find((s) => s.toLowerCase() === name.toLowerCase()))
+    .filter((s): s is StripSegment => s !== undefined)
+  if (INDIVIDUAL_SEGMENTS.every((s) => valid.includes(s))) return ['All']
+  return valid
+}
+
 function LightSettingsDrawer({
   open,
   isPhone,
   bulb,
+  stripActive,
   onClose,
   onBrightnessChange,
   onColorChange,
 }: DrawerProps) {
+  const isMainLight = bulb?.id === MAIN_LIGHT_ID
+  const [selectedSegments, setSelectedSegments] = useState<StripSegment[]>(() =>
+    deriveSelected(stripActive),
+  )
+  const [lastPushKey, setLastPushKey] = useState<string>('')
+
+  const openKey = open && isMainLight ? String(bulb?.id ?? '') : ''
+  const [lastOpenKey, setLastOpenKey] = useState<string>(openKey)
+  if (openKey !== lastOpenKey) {
+    setLastOpenKey(openKey)
+    if (openKey !== '') {
+      setSelectedSegments(deriveSelected(stripActive))
+      setLastPushKey('')
+    }
+  }
+
+  // Sync from server broadcasts (other clients, engine, etc.) while the drawer
+  // is open, using the "adjust state during render" pattern.
+  const serverKey = isMainLight ? (stripActive ?? []).slice().sort().join(',') : ''
+  const [lastServerKey, setLastServerKey] = useState<string>(serverKey)
+  if (open && isMainLight && serverKey !== lastServerKey) {
+    setLastServerKey(serverKey)
+    setSelectedSegments(deriveSelected(stripActive))
+  }
+
+  const applySegmentChange = (nextSegments: StripSegment[], color?: string) => {
+    if (!isMainLight || !color) {
+      return
+    }
+    const key = `${nextSegments.slice().sort().join(',')}|${color.toLowerCase()}`
+    if (key === lastPushKey) {
+      return
+    }
+    setLastPushKey(key)
+    // Empty selection = every zone off. Backend handles this via exclusive mode.
+    void postStripSegments(nextSegments, color)
+  }
+
+  const toggleSegment = (segment: StripSegment) => {
+    setSelectedSegments((current) => {
+      let next: StripSegment[]
+      if (segment === 'All') {
+        next = current.includes('All') ? [] : ['All']
+      } else {
+        const withoutAll = current.filter((s) => s !== 'All')
+        next = withoutAll.includes(segment)
+          ? withoutAll.filter((s) => s !== segment)
+          : [...withoutAll, segment]
+        // Collapse to "All" once every individual zone is picked.
+        if (INDIVIDUAL_SEGMENTS.every((s) => next.includes(s))) {
+          next = ['All']
+        }
+      }
+      if (next.length === 0) {
+        // Deselecting everything is a power-off intent for the strip.
+        setLastPushKey('')
+        void postMainLightPower(false)
+      } else if (bulb?.color) {
+        applySegmentChange(next, bulb.color)
+      }
+      return next
+    })
+  }
+
+  const handleColorSelect = (color: string) => {
+    if (isMainLight && selectedSegments.length > 0) {
+      // Drawer routes per-zone via the segments endpoint. We skip the /color
+      // endpoint here so a partial selection like ["Kitchen"] isn't clobbered
+      // by an implicit "all zones" color update.
+      applySegmentChange(selectedSegments, color)
+      return
+    }
+    onColorChange(bulb?.id, color)
+  }
+
   return (
     <MuiDrawer
       anchor="right"
@@ -111,7 +232,7 @@ function LightSettingsDrawer({
                   component="input"
                   type="color"
                   value={bulb?.color}
-                  onChange={(event) => onColorChange(bulb?.id, event.target.value)}
+                  onChange={(event) => handleColorSelect(event.target.value)}
                   sx={{
                     position: 'absolute',
                     inset: 0,
@@ -121,44 +242,40 @@ function LightSettingsDrawer({
                 />
               </Box>
             </Box>
-
-            <Box
+            <Typography variant="h6" sx={{ color: 'text.secondary', textAlign: 'center' }}>
+              {presetColors.find((c) => c.color === bulb?.color)?.name ?? "Custom"}
+            </Typography>
+            <Stack
+              direction="row"
               sx={{
-                display: 'grid',
-                gridTemplateColumns: 'repeat(4, minmax(0, 1fr))',
+                flexWrap: 'wrap',
+                marginTop: "1.5rem",
                 gap: 1.5,
+                width: '100%',
+                padding: '0 1rem',
               }}
             >
               {presetColors.map((preset) => {
                 const isSelected = preset.color.toLowerCase() === bulb?.color?.toLowerCase()
 
                 return (
-                  <ButtonBase
+                  <Box
                     key={preset.name}
-                    onClick={() => onColorChange(bulb?.id, preset.color)}
+                    onClick={() => handleColorSelect(preset.color)}
                     sx={{
-                      display: 'flex',
-                      flexDirection: 'column',
-                      alignItems: 'center',
-                      gap: 0.8,
-                      p: 0.5,
-                      borderRadius: 3,
+                      width: "3.5rem",
+                      height: "3.5rem",
+                      borderRadius: '50%',
+                      cursor: 'pointer',
+                      margin: "0.412rem",
+                      backgroundColor: preset.color,
+                      border: isSelected ? '2px solid #ffffff' : '2px solid rgba(255,255,255,0.16)',
+                      boxShadow: isSelected ? `0 0 0 5px ${alpha(preset.color, 0.22)}` : 'none',
                     }}
-                  >
-                    <Box
-                      sx={{
-                        width: 38,
-                        height: 38,
-                        borderRadius: '50%',
-                        backgroundColor: preset.color,
-                        border: isSelected ? '2px solid #ffffff' : '2px solid rgba(255,255,255,0.16)',
-                        boxShadow: isSelected ? `0 0 0 5px ${alpha(preset.color, 0.22)}` : 'none',
-                      }}
-                    />
-                  </ButtonBase>
+                  />
                 )
               })}
-            </Box>
+            </Stack>
           </Box>
 
           <Box
@@ -196,6 +313,77 @@ function LightSettingsDrawer({
               }}
             />
           </Box>
+
+
+          {isMainLight && (
+            <Box
+              sx={{
+                borderRadius: '1.5rem',
+                p: 2,
+                background: 'linear-gradient(180deg, rgba(255,255,255,0.04), rgba(255,255,255,0.02))',
+                border: '1px solid rgba(255,255,255,0.06)',
+              }}
+            >
+              <Stack direction="row" sx={{ alignItems: 'center', justifyContent: 'space-between', mb: 1 }}>
+                <Typography sx={{ fontWeight: 600 }}>Segments</Typography>
+                <Typography variant="caption" sx={{ color: 'text.secondary' }}>
+                  {selectedSegments.length === 0
+                    ? 'None'
+                    : selectedSegments.includes('All')
+                      ? 'All'
+                      : `${selectedSegments.length} selected`}
+                </Typography>
+              </Stack>
+
+              <Box
+                sx={{
+                  display: 'grid',
+                  gridTemplateColumns: 'repeat(2, minmax(0, 1fr))',
+                  columnGap: 1,
+                  rowGap: 0.25,
+                }}
+              >
+                {STRIP_SEGMENTS.map((segment) => {
+                  const checked = selectedSegments.includes(segment)
+                  const accent = bulb?.color ?? '#8ab4ff'
+                  return (
+                    <FormControlLabel
+                      key={segment}
+                      sx={{
+                        m: 0,
+                        px: 1,
+                        py: 0.25,
+                        borderRadius: 2,
+                        border: checked
+                          ? `1px solid ${alpha(accent, 0.5)}`
+                          : '1px solid rgba(255,255,255,0.06)',
+                        background: checked
+                          ? alpha(accent, 0.12)
+                          : 'transparent',
+                        transition: 'background 140ms ease, border-color 140ms ease',
+                      }}
+                      control={
+                        <Checkbox
+                          size="small"
+                          checked={checked}
+                          onChange={() => toggleSegment(segment)}
+                          sx={{
+                            color: 'rgba(255,255,255,0.35)',
+                            '&.Mui-checked': { color: accent },
+                          }}
+                        />
+                      }
+                      label={
+                        <Typography variant="body2" sx={{ fontWeight: 500 }}>
+                          {segment}
+                        </Typography>
+                      }
+                    />
+                  )
+                })}
+              </Box>
+            </Box>
+          )}
         </Stack>
       </Box>
     </MuiDrawer>

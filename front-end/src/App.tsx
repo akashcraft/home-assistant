@@ -60,12 +60,22 @@ const darkTheme = createTheme({
   },
 })
 
+type StripState = {
+  zones: string[]
+  colors: Record<string, string>
+  active: string[]
+  on: boolean
+}
+
 function App() {
   const isPhone = useMediaQuery(darkTheme.breakpoints.down('sm'))
   const [bulbs, setBulbs] = useState<Bulb[]>([])
   const [drawerOpen, setDrawerOpen] = useState(false)
   const [selectedBulbId, setSelectedBulbId] = useState<number>(0)
   const [currentDateTime, setCurrentDateTime] = useState(() => new Date())
+  const [stripState, setStripState] = useState<StripState>({
+    zones: [], colors: {}, active: [], on: false,
+  })
 
   const selectedBulb = bulbs.find((bulb) => bulb.id === selectedBulbId) ?? bulbs[0]
   const activeBulbs = bulbs.filter((bulb) => bulb.on).length
@@ -103,13 +113,27 @@ function App() {
       setBulbs((current) => current.map((bulb) => (bulb.id === incoming.id ? { ...bulb, ...incoming } : bulb)))
     }
 
+    const applyStripUpdate = (incoming: StripState) => {
+      if (!incoming || !Array.isArray(incoming.active)) {
+        return
+      }
+      setStripState({
+        zones: incoming.zones ?? [],
+        colors: incoming.colors ?? {},
+        active: incoming.active,
+        on: !!incoming.on,
+      })
+    }
+
     socket.on('bulbs_state', applyBulbsState)
     socket.on('bulb_updated', applyBulbUpdate)
+    socket.on('strip_updated', applyStripUpdate)
     socket.connect()
 
     return () => {
       socket.off('bulbs_state', applyBulbsState)
       socket.off('bulb_updated', applyBulbUpdate)
+      socket.off('strip_updated', applyStripUpdate)
       socket.disconnect()
     }
   }, [])
@@ -280,6 +304,7 @@ function App() {
           open={drawerOpen}
           isPhone={isPhone}
           bulb={selectedBulb}
+          stripActive={stripState.active}
           onClose={() => setDrawerOpen(false)}
           onColorChange={handleColorChange}
           onBrightnessChange={handleBrightnessChange}

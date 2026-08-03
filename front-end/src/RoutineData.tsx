@@ -38,7 +38,7 @@ export const routineData: RoutineData[] = [
       {
         bulbId: 1,
         actionType: 'brightness',
-        value: 10,
+        value: 100,
       },
     ]
   },
@@ -54,7 +54,7 @@ export const routineData: RoutineData[] = [
       {
         bulbId: 1,
         actionType: 'brightness',
-        value: 10,
+        value: 100,
       },
     ]
   },
