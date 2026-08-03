@@ -4,5 +4,7 @@ __pycache__/
 .vscode/
 engine/__pycache__/
 engine/.DS_Store
+engine/bulb_states.json
 bulb_state.json
 .DS_Store
+music/*

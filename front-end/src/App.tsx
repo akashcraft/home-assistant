@@ -5,9 +5,11 @@ import {
   Box,
   Chip,
   CssBaseline,
+  IconButton,
   Stack,
   Typography,
 } from '@mui/material'
+import { TuneRounded } from '@mui/icons-material'
 import { useMediaQuery } from '@mui/material'
 import { ThemeProvider, createTheme } from '@mui/material/styles'
 import { io, Socket } from 'socket.io-client'
@@ -15,6 +17,8 @@ import BulbDrawer from './Drawer'
 import Tile from './Tile'
 import { routineData } from './RoutineData'
 import RoutineTile from './RoutineTile'
+import MusicTile, { type MusicTrack } from './MusicTile'
+import LibraryDrawer from './LibraryDrawer'
 
 export type Bulb = {
   id?: number
@@ -67,6 +71,14 @@ type StripState = {
   on: boolean
 }
 
+type MusicState = {
+  playing: string | null
+  linked: boolean
+}
+
+const artUrl = (basename: string) =>
+  `${API_BASE_URL}/api/music/${encodeURIComponent(basename)}/art`
+
 function App() {
   const isPhone = useMediaQuery(darkTheme.breakpoints.down('sm'))
   const [bulbs, setBulbs] = useState<Bulb[]>([])
@@ -76,6 +88,10 @@ function App() {
   const [stripState, setStripState] = useState<StripState>({
     zones: [], colors: {}, active: [], on: false,
   })
+  const [musicTracks, setMusicTracks] = useState<MusicTrack[]>([])
+  const [musicState, setMusicState] = useState<MusicState>({ playing: null, linked: false })
+  const [libraryOpen, setLibraryOpen] = useState(false)
+  const [linkToLights, setLinkToLights] = useState(false)
 
   const selectedBulb = bulbs.find((bulb) => bulb.id === selectedBulbId) ?? bulbs[0]
   const activeBulbs = bulbs.filter((bulb) => bulb.on).length
@@ -125,15 +141,32 @@ function App() {
       })
     }
 
+    const applyMusicLibrary = (incoming: MusicTrack[]) => {
+      if (!Array.isArray(incoming)) return
+      setMusicTracks(incoming)
+    }
+
+    const applyMusicState = (incoming: MusicState) => {
+      if (!incoming) return
+      setMusicState({
+        playing: incoming.playing ?? null,
+        linked: !!incoming.linked,
+      })
+    }
+
     socket.on('bulbs_state', applyBulbsState)
     socket.on('bulb_updated', applyBulbUpdate)
     socket.on('strip_updated', applyStripUpdate)
+    socket.on('music_library_updated', applyMusicLibrary)
+    socket.on('music_updated', applyMusicState)
     socket.connect()
 
     return () => {
       socket.off('bulbs_state', applyBulbsState)
       socket.off('bulb_updated', applyBulbUpdate)
       socket.off('strip_updated', applyStripUpdate)
+      socket.off('music_library_updated', applyMusicLibrary)
+      socket.off('music_updated', applyMusicState)
       socket.disconnect()
     }
   }, [])
@@ -190,6 +223,41 @@ function App() {
     }
     updateBulb(bulbId, (item) => ({ ...item, color }))
     void postBulbCommand(bulbId, 'color', { color })
+  }
+
+  const refreshMusicLibrary = async () => {
+    try {
+      const res = await fetch(`${API_BASE_URL}/api/music`)
+      if (!res.ok) return
+      const data = await res.json()
+      if (Array.isArray(data)) setMusicTracks(data)
+    } catch {
+      // Ignore transient network errors; socket will resync later.
+    }
+  }
+
+  const handleMusicPlay = async (basename: string) => {
+    try {
+      const res = await fetch(`${API_BASE_URL}/api/music/${encodeURIComponent(basename)}/play`, {
+        method: 'POST',
+        headers: { 'Content-Type': 'application/json' },
+        body: JSON.stringify({ link_to_lights: linkToLights }),
+      })
+      if (!res.ok) {
+        const body = await res.json().catch(() => ({}))
+        window.alert(`Playback failed: ${body.error ?? res.statusText}`)
+      }
+    } catch (err) {
+      window.alert(`Playback failed: ${err instanceof Error ? err.message : String(err)}`)
+    }
+  }
+
+  const handleMusicStop = async () => {
+    try {
+      await fetch(`${API_BASE_URL}/api/music/stop`, { method: 'POST' })
+    } catch {
+      // Best-effort; the socket will echo the real state.
+    }
   }
 
   const currentDate = new Intl.DateTimeFormat(undefined, {
@@ -308,6 +376,111 @@ function App() {
           onClose={() => setDrawerOpen(false)}
           onColorChange={handleColorChange}
           onBrightnessChange={handleBrightnessChange}
+        />
+      </Box >
+      <Box
+        sx={{
+          px: { xs: 2, sm: 3, md: 4 },
+          py: { xs: 2, sm: 3, md: 4 },
+        }}
+      >
+        <Stack spacing={3} sx={{ width: '100%', maxWidth: 1240, mx: 'auto' }}>
+          <Stack
+            direction="row"
+            sx={{
+              alignItems: 'center',
+              justifyContent: 'space-between',
+              gap: 2,
+              flexWrap: 'wrap',
+            }}
+          >
+            <Stack spacing={1}>
+              <Typography variant="h4" sx={{ fontWeight: 700, lineHeight: 1.05 }}>
+                Music
+              </Typography>
+            </Stack>
+
+            <Stack direction="row" spacing={1.25} sx={{ alignItems: 'center', flexWrap: 'wrap', justifyContent: 'flex-end' }}>
+              <Chip
+                label={musicState.playing
+                  ? `Playing${musicState.linked ? ' · linked' : ''}`
+                  : `${musicTracks.length} track${musicTracks.length === 1 ? '' : 's'}`}
+                sx={{
+                  backgroundColor: alpha('#ffffff', 0.06),
+                  color: 'text.primary',
+                  border: '1px solid rgba(255,255,255,0.08)',
+                }}
+              />
+              <IconButton
+                aria-label="Open music library"
+                onClick={() => setLibraryOpen(true)}
+                sx={{
+                  width: 38,
+                  height: 38,
+                  borderRadius: '50%',
+                  backgroundColor: alpha('#ffffff', 0.06),
+                  border: '1px solid rgba(255,255,255,0.08)',
+                  color: 'text.primary',
+                  ':hover': { backgroundColor: alpha('#ffffff', 0.14) },
+                }}
+              >
+                <TuneRounded fontSize="small" />
+              </IconButton>
+            </Stack>
+          </Stack>
+
+          <Box sx={{ margin: "0.2rem !important" }} />
+
+          <Stack direction="row" sx={{ flexWrap: 'wrap', gap: 2 }}>
+            {musicTracks.length === 0 ? (
+              <Box
+                onClick={() => setLibraryOpen(true)}
+                sx={{
+                  width: '100%',
+                  maxWidth: isPhone ? '100%' : '14.25rem',
+                  minHeight: '11.5rem',
+                  borderRadius: 1,
+                  border: '1px dashed rgba(255,255,255,0.14)',
+                  display: 'grid',
+                  placeItems: 'center',
+                  cursor: 'pointer',
+                  color: 'text.secondary',
+                  transition: 'border-color 140ms ease, color 140ms ease',
+                  ':hover': { borderColor: 'rgba(255,255,255,0.3)', color: 'text.primary' },
+                }}
+              >
+                <Stack spacing={0.5} sx={{ alignItems: 'center' }}>
+                  <Typography sx={{ fontWeight: 600 }}>No tracks</Typography>
+                  <Typography variant="caption">Tap to open the library</Typography>
+                </Stack>
+              </Box>
+            ) : musicTracks.map((track) => (
+              <MusicTile
+                key={track.basename}
+                track={track}
+                isPlaying={musicState.playing === track.basename}
+                isPhone={isPhone}
+                artUrl={artUrl}
+                onPlay={handleMusicPlay}
+                onStop={handleMusicStop}
+              />
+            ))}
+          </Stack>
+        </Stack>
+
+        <LibraryDrawer
+          open={libraryOpen}
+          isPhone={isPhone}
+          tracks={musicTracks}
+          playing={musicState.playing}
+          linkToLights={linkToLights}
+          onLinkToLightsChange={setLinkToLights}
+          artUrl={artUrl}
+          apiBase={API_BASE_URL}
+          onClose={() => setLibraryOpen(false)}
+          onPlay={handleMusicPlay}
+          onStop={handleMusicStop}
+          onLibraryChanged={() => void refreshMusicLibrary()}
         />
       </Box >
     </ThemeProvider >

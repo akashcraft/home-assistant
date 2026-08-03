@@ -1,10 +1,14 @@
 import base64
 import json
+import re
+import signal
 import socket as socket_lib
+import subprocess
 import sys
+from io import BytesIO
 from pathlib import Path
-from threading import Lock, RLock
-from flask import Flask, jsonify, request
+from threading import Lock, RLock, Thread
+from flask import Flask, jsonify, request, send_from_directory
 from flask_socketio import SocketIO
 
 # --- 1. Setup paths and load Govee Library ---
@@ -177,6 +181,201 @@ def broadcast_strip_state():
     socketio.emit('strip_updated', payload)
 
 
+# --- 2c. Music library + playback --------------------------------------
+MUSIC_DIR = PROJECT_ROOT / "music"
+MUSIC_DIR.mkdir(exist_ok=True)
+ENGINE_DIR = PROJECT_ROOT / "engine"
+SAFE_NAME_RE = re.compile(r"[^A-Za-z0-9._ -]+")
+AUDIO_EXTS = {".mp3", ".wav", ".m4a", ".flac", ".ogg"}
+
+
+class MusicPlayback:
+    """Currently-running music process, if any. Only one plays at a time."""
+    process = None  # subprocess.Popen
+    basename = None
+    linked = False
+    lock = Lock()
+
+
+music_state = MusicPlayback()
+
+
+def _safe_basename(name: str) -> str:
+    stem = Path(name).stem
+    cleaned = SAFE_NAME_RE.sub("", stem).strip()
+    return cleaned or "track"
+
+
+def _track_paths(basename: str):
+    return {
+        "audio": None,  # resolved from disk since ext varies
+        "art": MUSIC_DIR / f"{basename}.png",
+        "json": MUSIC_DIR / f"{basename}.json",
+    }
+
+
+def _find_audio_file(basename: str):
+    for ext in AUDIO_EXTS:
+        p = MUSIC_DIR / f"{basename}{ext}"
+        if p.exists():
+            return p
+    return None
+
+
+def _music_broadcast():
+    with music_state.lock:
+        payload = {
+            "playing": music_state.basename,
+            "linked": music_state.linked,
+        }
+    socketio.emit("music_updated", payload)
+
+
+def _music_kill_locked():
+    """Terminate the current playback subprocess. Caller must hold the lock.
+    Sends SIGINT (not SIGTERM) so led_player.py's `except KeyboardInterrupt`
+    branch runs its finally block -- that's where the strip is blanked and
+    the bulbs are restored to their pre-song state."""
+    proc = music_state.process
+    if proc is not None:
+        try:
+            proc.send_signal(signal.SIGINT)
+            try:
+                # led_player restores 4 bulbs sequentially; give it room.
+                proc.wait(timeout=6.0)
+            except subprocess.TimeoutExpired:
+                proc.terminate()
+                try:
+                    proc.wait(timeout=2.0)
+                except subprocess.TimeoutExpired:
+                    proc.kill()
+        except Exception as e:
+            print(f"[music] stop error: {e}")
+    music_state.process = None
+    music_state.basename = None
+    music_state.linked = False
+
+
+def _music_stop():
+    with music_state.lock:
+        was_playing = music_state.process is not None
+        _music_kill_locked()
+    if was_playing:
+        _music_broadcast()
+
+
+def _stop_music_if_linked(reason: str = "user action"):
+    """Called from every bulb/strip mutation. When music is linked to lights,
+    a user tweaking a light means they want the routine, not the show -- so
+    kill playback immediately."""
+    with music_state.lock:
+        if not music_state.linked or music_state.process is None:
+            return
+        print(f"[music] stopping linked playback: {reason}")
+        _music_kill_locked()
+    _music_broadcast()
+
+
+def _music_watchdog(proc, basename: str):
+    """Wait for the subprocess to end and clean up state so the UI flips
+    back to the Play icon when the song finishes naturally."""
+    proc.wait()
+    with music_state.lock:
+        if music_state.process is proc and music_state.basename == basename:
+            music_state.process = None
+            music_state.basename = None
+            music_state.linked = False
+            emit_after = True
+        else:
+            emit_after = False
+    if emit_after:
+        _music_broadcast()
+
+
+def _list_music_tracks():
+    tracks = []
+    seen = set()
+    for path in sorted(MUSIC_DIR.iterdir()):
+        if path.suffix.lower() not in AUDIO_EXTS:
+            continue
+        base = path.stem
+        if base in seen:
+            continue
+        seen.add(base)
+        tracks.append({
+            "basename": base,
+            "filename": path.name,
+            "has_art": (MUSIC_DIR / f"{base}.png").exists(),
+            "has_json": (MUSIC_DIR / f"{base}.json").exists(),
+        })
+    return tracks
+
+
+def _extract_album_art(audio_path: Path, out_png: Path) -> bool:
+    """Pull embedded artwork from the audio file and write it as PNG.
+    Returns True on success. Never raises -- missing art isn't fatal."""
+    try:
+        from mutagen import File as MutagenFile
+        from PIL import Image
+    except ImportError as e:
+        print(f"[music] album art skipped, missing dep: {e}")
+        return False
+
+    try:
+        audio = MutagenFile(str(audio_path))
+        if audio is None:
+            return False
+
+        data = None
+        # ID3 (mp3)
+        tags = getattr(audio, "tags", None)
+        if tags:
+            for key in list(tags.keys()):
+                if key.startswith("APIC"):
+                    data = tags[key].data
+                    break
+        # MP4 / M4A
+        if data is None and hasattr(audio, "get"):
+            covr = audio.get("covr")
+            if covr:
+                data = bytes(covr[0])
+        # FLAC / OGG
+        if data is None and getattr(audio, "pictures", None):
+            data = audio.pictures[0].data
+
+        if not data:
+            return False
+
+        img = Image.open(BytesIO(data))
+        # Normalize to RGB PNG so the browser is guaranteed to render it.
+        if img.mode not in ("RGB", "RGBA"):
+            img = img.convert("RGB")
+        img.save(str(out_png), "PNG")
+        return True
+    except Exception as e:
+        print(f"[music] album art failed: {e}")
+        return False
+
+
+def _generate_timeline(audio_path: Path, include_bulbs: bool, segments_mode: str) -> None:
+    """Invoke engine/generate_timeline.py as a subprocess so librosa's heavy
+    import isn't paid in the Flask process. Blocks until the JSON is written."""
+    cmd = [
+        sys.executable,
+        str(ENGINE_DIR / "generate_timeline.py"),
+        str(audio_path),
+        "--segments", segments_mode,
+        "--bulbs" if include_bulbs else "--no-bulbs",
+    ]
+    print(f"[music] generating timeline: {' '.join(cmd)}")
+    result = subprocess.run(cmd, capture_output=True, text=True)
+    if result.returncode != 0:
+        raise RuntimeError(
+            f"generate_timeline failed (exit {result.returncode}): "
+            f"{result.stderr.strip() or result.stdout.strip()}"
+        )
+
+
 def strip_apply_power(on):
     """Turn the strip on/off via razer, never via govee. Govee power toggles
     knock the strip out of razer mode until a full reboot, which is what
@@ -254,7 +453,7 @@ def handle_preflight():
 def add_cors_headers(response):
     response.headers['Access-Control-Allow-Origin'] = '*'
     response.headers['Access-Control-Allow-Headers'] = 'Content-Type'
-    response.headers['Access-Control-Allow-Methods'] = 'GET, POST, OPTIONS'
+    response.headers['Access-Control-Allow-Methods'] = 'GET, POST, DELETE, OPTIONS'
     return response
 
 
@@ -266,6 +465,7 @@ def get_bulbs():
 
 @app.route('/api/bulbs/<int:bulb_id>/toggle', methods=['POST', 'OPTIONS'])
 def toggle_bulb(bulb_id):
+    _stop_music_if_linked(f"bulb {bulb_id} toggled")
     bulb = bulbs.get(str(bulb_id))
     if not bulb:
         return jsonify({'error': 'Bulb not found'}), 404
@@ -281,8 +481,9 @@ def toggle_bulb(bulb_id):
 
 @app.route('/api/bulbs/<int:bulb_id>/power', methods=['POST', 'OPTIONS'])
 def set_bulb_power(bulb_id):
+    _stop_music_if_linked(f"bulb {bulb_id} power")
     payload = request.get_json(silent=True) or {}
-    
+
     bulb = bulbs.get(str(bulb_id))
     if not bulb:
         return jsonify({'error': 'Bulb not found'}), 404
@@ -297,8 +498,9 @@ def set_bulb_power(bulb_id):
 
 @app.route('/api/bulbs/<int:bulb_id>/brightness', methods=['POST', 'OPTIONS'])
 def set_bulb_brightness(bulb_id):
+    _stop_music_if_linked(f"bulb {bulb_id} brightness")
     payload = request.get_json(silent=True) or {}
-    
+
     bulb = bulbs.get(str(bulb_id))
     if not bulb:
         return jsonify({'error': 'Bulb not found'}), 404
@@ -314,8 +516,9 @@ def set_bulb_brightness(bulb_id):
 
 @app.route('/api/bulbs/<int:bulb_id>/color', methods=['POST', 'OPTIONS'])
 def set_bulb_color(bulb_id):
+    _stop_music_if_linked(f"bulb {bulb_id} color")
     payload = request.get_json(silent=True) or {}
-    
+
     bulb = bulbs.get(str(bulb_id))
     if not bulb:
         return jsonify({'error': 'Bulb not found'}), 404
@@ -338,6 +541,7 @@ def strip_segments():
     if request.method == 'GET':
         return jsonify({'zones': STRIP_ZONE_ORDER, 'colors': strip_zone_colors})
 
+    _stop_music_if_linked("strip segments changed")
     payload = request.get_json(silent=True) or {}
     raw_segments = payload.get('segments') or []
     color = payload.get('color', '#ffffff')
@@ -377,6 +581,147 @@ def strip_segments():
     })
 
 
+@app.route('/api/music', methods=['GET', 'OPTIONS'])
+def list_music():
+    return jsonify(_list_music_tracks())
+
+
+@app.route('/api/music/upload', methods=['POST', 'OPTIONS'])
+def upload_music():
+    file = request.files.get('audio')
+    if file is None or not file.filename:
+        return jsonify({'error': 'no audio file provided'}), 400
+
+    include_bulbs = str(request.form.get('include_bulbs', 'true')).lower() == 'true'
+    segments_mode = str(request.form.get('segments_mode', 'mix')).lower()
+    if segments_mode not in ('all', 'zones', 'mix'):
+        segments_mode = 'mix'
+
+    ext = Path(file.filename).suffix.lower()
+    if ext not in AUDIO_EXTS:
+        return jsonify({'error': f'unsupported extension {ext}'}), 400
+
+    base = _safe_basename(file.filename)
+    # Don't clobber an existing track: append -N to disambiguate.
+    candidate = base
+    counter = 2
+    while _find_audio_file(candidate) is not None:
+        candidate = f"{base}-{counter}"
+        counter += 1
+    base = candidate
+
+    audio_path = MUSIC_DIR / f"{base}{ext}"
+    file.save(str(audio_path))
+
+    art_ok = _extract_album_art(audio_path, MUSIC_DIR / f"{base}.png")
+    if not art_ok:
+        # Not a fatal error -- the tile falls back to a placeholder -- but
+        # the UI wants a distinct signal so it can window.alert() the user.
+        pass
+
+    try:
+        _generate_timeline(audio_path, include_bulbs, segments_mode)
+    except Exception as e:
+        # Roll back audio + art so a broken track doesn't clutter the list.
+        for p in (audio_path, MUSIC_DIR / f"{base}.png"):
+            try:
+                if p.exists():
+                    p.unlink()
+            except Exception:
+                pass
+        return jsonify({'error': f'timeline generation failed: {e}'}), 500
+
+    socketio.emit('music_library_updated', _list_music_tracks())
+    return jsonify({
+        'basename': base,
+        'filename': audio_path.name,
+        'has_art': art_ok,
+        'has_json': (MUSIC_DIR / f"{base}.json").exists(),
+    })
+
+
+@app.route('/api/music/<basename>/art', methods=['GET', 'OPTIONS'])
+def get_music_art(basename):
+    safe = _safe_basename(basename)
+    art = MUSIC_DIR / f"{safe}.png"
+    if not art.exists():
+        return jsonify({'error': 'no art'}), 404
+    return send_from_directory(str(MUSIC_DIR), f"{safe}.png")
+
+
+@app.route('/api/music/<basename>/play', methods=['POST', 'OPTIONS'])
+def play_music(basename):
+    safe = _safe_basename(basename)
+    audio = _find_audio_file(safe)
+    if audio is None:
+        return jsonify({'error': 'track not found'}), 404
+
+    payload = request.get_json(silent=True) or {}
+    link = bool(payload.get('link_to_lights', False))
+
+    if link:
+        json_path = MUSIC_DIR / f"{safe}.json"
+        if not json_path.exists():
+            return jsonify({'error': 'no timeline JSON for this track'}), 400
+        cmd = [sys.executable, str(ENGINE_DIR / "led_player.py"),
+               str(audio), str(json_path)]
+    else:
+        cmd = [sys.executable, str(ENGINE_DIR / "play_music.py"), str(audio)]
+
+    with music_state.lock:
+        _music_kill_locked()
+        try:
+            proc = subprocess.Popen(cmd, cwd=str(ENGINE_DIR))
+        except Exception as e:
+            return jsonify({'error': f'failed to start playback: {e}'}), 500
+        music_state.process = proc
+        music_state.basename = safe
+        music_state.linked = link
+
+    Thread(target=_music_watchdog, args=(proc, safe), daemon=True).start()
+    _music_broadcast()
+    return jsonify({'playing': safe, 'linked': link})
+
+
+@app.route('/api/music/stop', methods=['POST', 'OPTIONS'])
+def stop_music_endpoint():
+    _music_stop()
+    return jsonify({'playing': None})
+
+
+@app.route('/api/music/<basename>', methods=['DELETE', 'OPTIONS'])
+def delete_music(basename):
+    safe = _safe_basename(basename)
+    with music_state.lock:
+        if music_state.basename == safe and music_state.process is not None:
+            _music_kill_locked()
+            was_playing = True
+        else:
+            was_playing = False
+    if was_playing:
+        _music_broadcast()
+
+    removed = []
+    audio = _find_audio_file(safe)
+    if audio is not None:
+        try:
+            audio.unlink()
+            removed.append(audio.name)
+        except Exception as e:
+            return jsonify({'error': f'failed to delete audio: {e}'}), 500
+    for suffix in ('.png', '.json'):
+        p = MUSIC_DIR / f"{safe}{suffix}"
+        if p.exists():
+            try:
+                p.unlink()
+                removed.append(p.name)
+            except Exception as e:
+                print(f"[music] delete side-file failed: {e}")
+
+    socketio.emit('music_library_updated', _list_music_tracks())
+    return jsonify({'removed': removed})
+
+
 @app.route('/health', methods=['GET'])
 def health():
     return jsonify({'status': 'ok'})
@@ -387,6 +732,8 @@ def health():
 def handle_connect():
     socketio.emit('bulbs_state', list(bulbs.values()))
     broadcast_strip_state()
+    socketio.emit('music_library_updated', _list_music_tracks())
+    _music_broadcast()
 
 
 if __name__ == '__main__':
