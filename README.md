@@ -1,17 +1,15 @@
 # Home Lights
-Web-based control hub for a hybrid lighting setup - a 45-pixel Govee LED strip and four Govee smart bulbs on the LAN - with routines, per-segment control, and a music-reactive engine that syncs the whole room to a song.
+Web-based control hub for an all local smart lighting, no internet needed. A 45-pixel Govee LED strip and four Govee smart bulbs on the LAN - with routines, per-segment control, and a music-reactive engine that syncs the whole room to a song. I plan to add a robot vacuum cleaner in future.
 
 <img width=600px src="https://github.com/user-attachments/assets/66cb0c32-305a-4b47-9049-984a042995a8">
 
 ## Features
-- Dark Mode React frontend, phone-friendly
+- Dark Mode and Phone-friendly
 - One-tap Routines (Kitchen, Red, Orange, Maximum, Sleep)
 - Per-bulb Power, Colour, and Brightness with live socket updates
-- LED strip per-segment control (Table / Bed / Kitchen / Main / Final)
-- Hybrid strip driver - Govee LAN for whole-strip / power / brightness, Razer protocol only for mixed-zone frames
+- LED strip per-segment control
 - Music library with album art extraction and auto-generated LED timelines from `librosa` beat analysis
 - Optional "Enable Light Show" playback mode that drives the whole room in time with the track
-- Any manual bulb or routine change during a light show immediately stops the music
 - Bulb offline detection with automatic UI lockout, only pinging while a client is connected
 - Persistent library preferences via `localStorage`
 
@@ -32,14 +30,20 @@ Runs headless on an Orange Pi Zero 3 (or anything similar). The frontend can be 
 <img width=300px src="http://www.orangepi.org/img/zero3/0627-zero3%20(9).png">
 
 Devices used:
-- 1 x Govee RGBIC LED strip at `192.168.2.30` (the main light, exposed as id `1`)
-- 2 x Kitchen Govee bulbs at `192.168.2.25` and `.26` (ids `2`, `3`)
-- 1 x Living Room Govee bulb at `192.168.2.28` (id `4`)
-- 1 x Hallway Govee bulb at `192.168.2.29` (id `5`)
+- 1 x Orange Pi Zero 3
+- 1 x [Govee RGBIC LED H618F strip](https://www.amazon.ca/dp/B09VBZC2CX?ref=ppx_yo2ov_dt_b_fed_asin_title&th=1)
+- 4 x [Govee H6008 bulbs](https://www.amazon.ca/dp/B09B7NQT2K?ref=ppx_yo2ov_dt_b_fed_asin_title&th=1)
+- 2 x [Mechanical Timer Plugs](https://www.amazon.ca/dp/B01LPT0IQA?ref=ppx_yo2ov_dt_b_fed_asin_title&th=1)
+- 2 x Samsung Galaxy Tab A8 for Front-End Control
 
 All devices need LAN control enabled in the Govee Home app.
 
 ## Installation
+
+### System dependencies (Debian)
+```
+sudo apt update && sudo apt-get install git python3-venv ffmpeg libsndfile1
+```
 
 ### Backend
 Python 3.11+ recommended. Create a virtual environment and install the requirements:
@@ -64,13 +68,8 @@ npm run dev
 ```
 For a production deploy, `npm run build` and serve the `dist/` folder from any static host - or point `send_from_directory` in `server.py` at it and serve from one process.
 
-Update `API_BASE_URL` in `front-end/src/App.tsx` and `front-end/src/Drawer.tsx` to your server's IP if it isn't `192.168.2.27:8080`.
-
-### System dependencies (Debian / Armbian / DietPi)
-```
-sudo apt install python3-venv ffmpeg libsndfile1
-```
-`ffmpeg` and `libsndfile1` are pulled in by `librosa` for audio decoding.
+> [!IMPORTANT]
+> Update `API_BASE_URL` in `front-end/src/App.tsx` and `front-end/src/Drawer.tsx` to your server's IP.
 
 ## Changing Bulb Defaults
 Bulb state lives in `bulb_state.json` at the project root. First launch creates it from the defaults baked into `server.py`. Edit the file (or the `DEFAULT_BULBS` dict in `server.py`) to change the IP list, names, or starting colours. Restart `server.py` to reload.
@@ -87,7 +86,7 @@ Example entry:
 }
 ```
 
-The 45-pixel strip zones are defined in `server.py` (`STRIP_ZONES`) and mirrored in `engine/led_patterns.py`. Both must stay in sync if you change pixel ranges.
+The 45-pixel strip zones are defined in `server.py` (`STRIP_ZONES`) and mirrored in `engine/led_patterns.py`. Both must stay in sync if you change pixel ranges. The code is reverse engineered thanks to https://github.com/nicolasdeory/govee-realtime-control
 
 ## Music Engine
 `engine/generate_timeline.py` analyses a song (tempo, beats, RMS, HPSS) and writes a JSON timeline of LED events. `engine/led_player.py` plays the mp3 and drives the strip + bulbs in sync at ~30 FPS. `engine/play_music.py` is a small `pygame.mixer` wrapper used when the light show is disabled.
