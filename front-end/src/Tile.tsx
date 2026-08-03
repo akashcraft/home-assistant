@@ -15,7 +15,8 @@ function Tile({ bulb, onToggle, onOpenSettings, isPhone }: TileProps) {
     return null
   }
 
-  const accent = bulb.on ? bulb.color : '#6b7280'
+  const isOffline = bulb.online === false
+  const accent = !isOffline && bulb.on ? bulb.color : '#6b7280'
 
   return (
     <Card
@@ -26,16 +27,21 @@ function Tile({ bulb, onToggle, onOpenSettings, isPhone }: TileProps) {
         maxWidth: isPhone ? '100%' : '14.25rem',
         overflow: 'hidden',
         borderRadius: 1,
-        border: bulb.on ? `1px solid ${alpha(bulb.color ?? '#6b7280', 0.35)}` : '1px solid rgba(255,255,255,0.06)',
-        background: bulb.on
+        border: !isOffline && bulb.on ? `1px solid ${alpha(bulb.color ?? '#6b7280', 0.35)}` : '1px solid rgba(255,255,255,0.06)',
+        background: !isOffline && bulb.on
           ? `linear-gradient(180deg, ${alpha(bulb.color ?? '#6b7280', 0.22)} 0%, rgba(14, 16, 24, 0.94) 32%, rgba(9, 10, 15, 0.98) 100%)`
           : 'linear-gradient(180deg, rgba(30, 34, 42, 0.95) 0%, rgba(12, 14, 18, 0.98) 100%)',
-        transition: 'transform 140ms ease, box-shadow 140ms ease, border-color 140ms ease',
+        opacity: isOffline ? 0.55 : 1,
+        transition: 'transform 140ms ease, box-shadow 140ms ease, border-color 140ms ease, opacity 140ms ease',
+        pointerEvents: isOffline ? 'none' : 'auto',
         ":hover": {
-          cursor: 'pointer',
+          cursor: isOffline ? 'not-allowed' : 'pointer',
         },
       }}
-      onClick={() => onToggle(bulb?.id ?? 0)}
+      onClick={() => {
+        if (isOffline) return
+        onToggle(bulb?.id ?? 0)
+      }}
     >
       <Box
         sx={{
@@ -72,11 +78,11 @@ function Tile({ bulb, onToggle, onOpenSettings, isPhone }: TileProps) {
 
           <Chip
             size="small"
-            label={bulb.on ? 'On' : 'Off'}
+            label={isOffline ? 'Offline' : bulb.on ? 'On' : 'Off'}
             sx={{
-              backgroundColor: bulb.on ? alpha(bulb.color ?? '#6b7280', 0.18) : alpha('#ffffff', 0.06),
-              color: bulb.on ? '#ffffff' : 'text.secondary',
-              border: bulb.on ? `1px solid ${alpha(bulb.color ?? '#6b7280', 0.28)}` : '1px solid rgba(255,255,255,0.06)',
+              backgroundColor: bulb.on && !isOffline ? alpha(bulb.color ?? '#6b7280', 0.18) : alpha('#ffffff', 0.06),
+              color: bulb.on && !isOffline ? '#ffffff' : 'text.secondary',
+              border: bulb.on && !isOffline ? `1px solid ${alpha(bulb.color ?? '#6b7280', 0.28)}` : '1px solid rgba(255,255,255,0.06)',
             }}
           />
         </Box>
@@ -88,7 +94,7 @@ function Tile({ bulb, onToggle, onOpenSettings, isPhone }: TileProps) {
             </Typography>
             <Typography sx={{ color: 'text.secondary' }}>{presetColors.find((c) => c.color === bulb.color)?.name || "Custom"}</Typography>
             <Typography variant="body2" sx={{ color: 'text.secondary' }}>
-              Brightness {bulb.brightness}%
+              {isOffline ? 'Offline' : `Brightness ${bulb.brightness}%`}
             </Typography>
           </Stack>
         </Box>

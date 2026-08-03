@@ -4,8 +4,9 @@
     "name": "Main Light",
     "ip": "192.168.2.30",
     "on": true,
-    "brightness": 10,
-    "color": "#ff0000"
+    "brightness": 100,
+    "color": "#ff0000",
+    "online": true
   },
   "2": {
     "id": 2,
@@ -13,7 +14,8 @@
     "ip": "192.168.2.25",
     "on": false,
     "brightness": 100,
-    "color": "#ffffff"
+    "color": "#ffffff",
+    "online": false
   },
   "3": {
     "id": 3,
@@ -21,15 +23,17 @@
     "ip": "192.168.2.26",
     "on": false,
     "brightness": 100,
-    "color": "#ffffff"
+    "color": "#ffffff",
+    "online": false
   },
   "4": {
     "id": 4,
     "name": "Living Room Bulb",
     "ip": "192.168.2.28",
     "on": false,
-    "brightness": 10,
-    "color": "#ff680a"
+    "brightness": 100,
+    "color": "#ffffff",
+    "online": true
   },
   "5": {
     "id": 5,
@@ -37,6 +41,7 @@
     "ip": "192.168.2.29",
     "on": false,
     "brightness": 100,
-    "color": "#ffffff"
+    "color": "#ffffff",
+    "online": true
   }
 }

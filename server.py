@@ -1,13 +1,15 @@
 import base64
 import json
+import platform
 import re
 import signal
 import socket as socket_lib
 import subprocess
 import sys
+import time
 from io import BytesIO
 from pathlib import Path
-from threading import Lock, RLock, Thread
+from threading import Event, Lock, RLock, Thread
 from flask import Flask, jsonify, request, send_from_directory
 from flask_socketio import SocketIO
 
@@ -19,7 +21,13 @@ if LOCAL_DEPS.exists() and str(LOCAL_DEPS) not in sys.path:
     sys.path.insert(0, str(LOCAL_DEPS))
 
 try:
-    from govee.api.lan import power, brightness, color
+    from govee.api.lan import power as govee_power
+    from govee.api.lan import brightness as govee_brightness
+    from govee.api.lan import color as govee_color
+    # Backwards-compat aliases for the rest of the file:
+    power = govee_power
+    brightness = govee_brightness
+    color = govee_color
     GOVEE_AVAILABLE = True
 except ImportError:
     GOVEE_AVAILABLE = False
@@ -68,6 +76,71 @@ def save_bulbs():
 # Load the data into memory when the script starts
 bulbs = load_bulbs()
 
+# --- 2a. Bulb reachability monitor ------------------------------------
+BULB_CHECK_INTERVAL = 12  # seconds between full sweeps
+BULB_PING_TIMEOUT = 2     # seconds waited per ping subprocess
+
+# Monitor only runs while at least one browser tab is connected. Saves ~25
+# subprocess-fork'd pings per minute when nobody's looking at the UI.
+_active_clients = 0
+_clients_lock = Lock()
+_monitor_wakeup = Event()
+
+
+def _ping_ip(ip):
+    """Return True if the host answers a single ICMP echo. Uses the platform
+    ping binary so we don't need raw-socket permissions."""
+    if not ip:
+        return False
+    if platform.system().lower().startswith('win'):
+        args = ['ping', '-n', '1', '-w', '1000', ip]
+    else:
+        args = ['ping', '-c', '1', '-W', '1000', ip]
+    try:
+        result = subprocess.run(args, capture_output=True, timeout=BULB_PING_TIMEOUT)
+        return result.returncode == 0
+    except Exception:
+        return False
+
+
+def _bulb_monitor_loop():
+    """Every BULB_CHECK_INTERVAL seconds, ping each bulb. Flip `online` and
+    force `on=false` when a bulb goes unreachable; broadcast on change.
+
+    Pauses when no clients are connected (nobody would see the update
+    anyway) and wakes immediately when the first client connects."""
+    for b in bulbs.values():
+        b.setdefault('online', True)
+    while True:
+        with _clients_lock:
+            has_clients = _active_clients > 0
+        if not has_clients:
+            # Block until a client connects and pokes the event.
+            _monitor_wakeup.wait()
+            _monitor_wakeup.clear()
+            continue
+        try:
+            for bid, bulb in list(bulbs.items()):
+                ip = bulb.get('ip')
+                if not ip:
+                    continue
+                online = _ping_ip(ip)
+                prev = bool(bulb.get('online', True))
+                if online == prev:
+                    continue
+                bulb['online'] = online
+                if not online:
+                    bulb['on'] = False
+                save_bulbs()
+                socketio.emit('bulb_updated', bulb)
+                print(f"[monitor] bulb {bid} ({ip}) -> {'online' if online else 'offline'}")
+        except Exception as e:
+            print(f"[monitor] sweep error: {e}")
+        time.sleep(BULB_CHECK_INTERVAL)
+
+
+Thread(target=_bulb_monitor_loop, daemon=True).start()
+
 
 # --- 2b. Strip per-segment control (id=1 only) ----------------------------
 # The 45-pixel strip at 192.168.2.30 speaks the "razer" UDP protocol on port 4003.
@@ -89,12 +162,17 @@ STRIP_ZONE_ORDER = list(STRIP_ZONES.keys())
 # Last-known color per zone -- lets partial updates (e.g. "just Kitchen")
 # preserve the other zones' colors instead of blacking them out.
 strip_zone_colors = {name: "#000000" for name in STRIP_ZONES}
-# Razer has no dedicated brightness command; we scale each RGB channel by
-# strip_brightness / 100 before sending, which the eye reads as dimming.
+# Brightness is applied via govee LAN (hardware PWM). In pure razer mode we
+# additionally scale RGB channels since razer has no brightness command.
 strip_brightness = 100
 strip_udp_sock = socket_lib.socket(socket_lib.AF_INET, socket_lib.SOCK_DGRAM)
 strip_lock = RLock()
 _strip_razer_enabled = False
+# Hybrid: 'govee' handles power/whole-strip color/brightness, 'razer' takes
+# over only for genuinely per-zone segment frames. Razer's black frame
+# doesn't stick in hardware (the strip re-lights itself), so real off has
+# to be govee power=False.
+_strip_mode = 'govee'
 
 
 def _razer_checksum(packet):
@@ -135,10 +213,76 @@ def _normalize_zone(name):
     return None
 
 
+def _enter_razer_mode():
+    global _strip_razer_enabled, _strip_mode
+    with strip_lock:
+        if not _strip_razer_enabled:
+            try:
+                strip_udp_sock.sendto(_razer_control_packet(True), (STRIP_IP, STRIP_PORT))
+            except OSError as e:
+                print(f"Strip razer-enable failed: {e}")
+        _strip_razer_enabled = True
+        _strip_mode = 'razer'
+
+
+def _leave_razer_mode():
+    """Return the strip to govee's stateful color/brightness so govee LAN
+    commands render again."""
+    global _strip_razer_enabled, _strip_mode
+    with strip_lock:
+        if _strip_razer_enabled:
+            try:
+                strip_udp_sock.sendto(_razer_control_packet(False), (STRIP_IP, STRIP_PORT))
+            except OSError as e:
+                print(f"Strip razer-disable failed: {e}")
+        _strip_razer_enabled = False
+        _strip_mode = 'govee'
+
+
+def _strip_ip():
+    return (bulbs.get('1') or {}).get('ip') or STRIP_IP
+
+
+def _govee_send_power(on):
+    if not GOVEE_AVAILABLE:
+        return
+    try:
+        power.send_power(device_ip=_strip_ip(), on=bool(on))
+    except Exception as e:
+        print(f"Strip govee power failed: {e}")
+
+
+def _govee_send_color(hex_color):
+    if not GOVEE_AVAILABLE:
+        return
+    try:
+        clean = (hex_color or '#ffffff').lstrip('#')
+        r, g, b = int(clean[0:2], 16), int(clean[2:4], 16), int(clean[4:6], 16)
+        ip = _strip_ip()
+        low = (hex_color or '').lower()
+        if low == '#ffffff':
+            color.send_color(device_ip=ip, rgb=(r, g, b), color_temp_kelvin=9000)
+        elif low == '#ff680a':
+            color.send_color(device_ip=ip, rgb=(r, g, b), color_temp_kelvin=2000)
+        else:
+            color.send_color(device_ip=ip, rgb=(r, g, b))
+    except Exception as e:
+        print(f"Strip govee color failed: {e}")
+
+
+def _govee_send_brightness(pct):
+    if not GOVEE_AVAILABLE:
+        return
+    try:
+        brightness.send_brightness(device_ip=_strip_ip(), percent=int(pct))
+    except Exception as e:
+        print(f"Strip govee brightness failed: {e}")
+
+
 def send_strip_frame(force_black=False):
-    """Push a razer frame to the strip. force_black=True sends all-off pixels
-    without mutating strip_zone_colors (so re-powering can restore state)."""
-    global _strip_razer_enabled
+    """Push a razer frame to the strip. force_black=True is only used by the
+    engine cleanup path; server routes normally take the govee power path
+    since razer 'all-black' doesn't hold in hardware."""
     with strip_lock:
         if force_black:
             buffer = [(0, 0, 0)] * STRIP_PIXELS
@@ -152,10 +296,8 @@ def send_strip_frame(force_black=False):
                 start, end = STRIP_ZONES[zone]
                 for i in range(start, end + 1):
                     buffer[i] = (r, g, b)
+        _enter_razer_mode()
         try:
-            if not _strip_razer_enabled:
-                strip_udp_sock.sendto(_razer_control_packet(True), (STRIP_IP, STRIP_PORT))
-                _strip_razer_enabled = True
             strip_udp_sock.sendto(_razer_frame_packet(buffer), (STRIP_IP, STRIP_PORT))
         except OSError as e:
             print(f"Strip UDP send failed: {e}")
@@ -236,6 +378,7 @@ def _music_kill_locked():
     Sends SIGINT (not SIGTERM) so led_player.py's `except KeyboardInterrupt`
     branch runs its finally block -- that's where the strip is blanked and
     the bulbs are restored to their pre-song state."""
+    global _strip_razer_enabled, _strip_mode
     proc = music_state.process
     if proc is not None:
         try:
@@ -254,6 +397,11 @@ def _music_kill_locked():
     music_state.process = None
     music_state.basename = None
     music_state.linked = False
+    # led_player sends razer control(False) in its finally block, so the
+    # strip is back in govee mode. Sync our flags so subsequent user actions
+    # take the govee path immediately without stale razer state.
+    _strip_razer_enabled = False
+    _strip_mode = 'govee'
 
 
 def _music_stop():
@@ -279,6 +427,7 @@ def _stop_music_if_linked(reason: str = "user action"):
 def _music_watchdog(proc, basename: str):
     """Wait for the subprocess to end and clean up state so the UI flips
     back to the Play icon when the song finishes naturally."""
+    global _strip_razer_enabled, _strip_mode
     proc.wait()
     with music_state.lock:
         if music_state.process is proc and music_state.basename == basename:
@@ -288,6 +437,9 @@ def _music_watchdog(proc, basename: str):
             emit_after = True
         else:
             emit_after = False
+    # Same razer-flag sync as _music_kill_locked -- covers natural song end.
+    _strip_razer_enabled = False
+    _strip_mode = 'govee'
     if emit_after:
         _music_broadcast()
 
@@ -377,44 +529,58 @@ def _generate_timeline(audio_path: Path, include_bulbs: bool, segments_mode: str
 
 
 def strip_apply_power(on):
-    """Turn the strip on/off via razer, never via govee. Govee power toggles
-    knock the strip out of razer mode until a full reboot, which is what
-    caused 'react shows on but hardware stays off' after an unselect-all."""
+    """Power the strip on/off via govee. Razer 'all-black' doesn't stick in
+    hardware -- the strip re-lights itself after a moment -- so real off has
+    to go through the govee LAN power command."""
+    _leave_razer_mode()
+    _govee_send_power(bool(on))
     if on:
+        # Re-apply the saved color so the strip comes back looking the same
+        # instead of whatever govee-default it had before.
+        bulb1 = bulbs.get('1') or {}
+        saved_color = bulb1.get('color') or '#ffffff'
+        _govee_send_color(saved_color)
+        _govee_send_brightness(strip_brightness)
         with strip_lock:
-            has_any = any(strip_zone_colors[z] != "#000000" for z in STRIP_ZONES)
-            if not has_any:
-                # Nothing was lit -- default every zone to the bulb's saved
-                # color so re-powering isn't a silent no-op.
-                bulb1 = bulbs.get('1') or {}
-                default_color = bulb1.get('color') or '#ffffff'
-                for zone in STRIP_ZONES:
-                    strip_zone_colors[zone] = default_color
-        send_strip_frame()
+            # State: whole strip = saved color.
+            for zone in STRIP_ZONES:
+                strip_zone_colors[zone] = saved_color
     else:
-        send_strip_frame(force_black=True)
+        with strip_lock:
+            for zone in STRIP_ZONES:
+                strip_zone_colors[zone] = '#000000'
+    broadcast_strip_state()
 
 
 # --- 3. Helper Functions ---
 def update_hardware(bulb, action, value):
-    """Send commands to the physical device. id=1 is the LED strip and speaks
-    razer, not govee -- routed here to keep call sites uniform."""
+    """Send commands to the physical device. id=1 is the LED strip; we drive
+    it primarily via govee LAN and only fall through to razer for genuine
+    per-zone segment work (see /api/bulbs/1/segments)."""
     if bulb.get('id') == 1:
         global strip_brightness
         if action == "power":
             strip_apply_power(bool(value))
         elif action == "color":
-            hex_color = str(value or "#000000")
+            hex_color = str(value or "#ffffff")
+            _leave_razer_mode()
+            _govee_send_power(True)
+            _govee_send_color(hex_color)
+            _govee_send_brightness(strip_brightness)
             with strip_lock:
-                lit = [z for z in STRIP_ZONES if strip_zone_colors[z] != "#000000"]
-                targets = lit if lit else list(STRIP_ZONES.keys())
-                for zone in targets:
+                for zone in STRIP_ZONES:
                     strip_zone_colors[zone] = hex_color
-            strip_apply_power(True)
+            broadcast_strip_state()
         elif action == "brightness":
             with strip_lock:
                 strip_brightness = max(0, min(100, int(value)))
-            send_strip_frame()
+            _govee_send_brightness(strip_brightness)
+            # If we happen to be in razer mode, re-render so the scaled RGB
+            # reflects the new brightness immediately.
+            if _strip_mode == 'razer':
+                send_strip_frame()
+            else:
+                broadcast_strip_state()
         return
 
     if not GOVEE_AVAILABLE:
@@ -564,13 +730,34 @@ def strip_segments():
             for zone in targets:
                 strip_zone_colors[zone] = color
 
-    send_strip_frame()
+        non_black = {c for c in strip_zone_colors.values() if c != '#000000'}
+        all_lit_same = (
+            len(non_black) == 1
+            and all(strip_zone_colors[z] != '#000000' for z in STRIP_ZONES)
+        )
+        nothing_lit = (len(non_black) == 0)
+
+    # Route: nothing lit -> govee power off (razer black wouldn't stick).
+    # Whole strip one color -> govee (proper hardware brightness/color).
+    # Genuine mix -> razer frame.
+    if nothing_lit:
+        _leave_razer_mode()
+        _govee_send_power(False)
+        broadcast_strip_state()
+    elif all_lit_same:
+        uniform = next(iter(non_black))
+        _leave_razer_mode()
+        _govee_send_power(True)
+        _govee_send_color(uniform)
+        _govee_send_brightness(strip_brightness)
+        broadcast_strip_state()
+    else:
+        send_strip_frame()
 
     bulb = bulbs.get('1')
     if bulb is not None:
         bulb['color'] = color
-        # The strip is "on" if any zone is lit; empty targets means blackout.
-        bulb['on'] = any(c != '#000000' for c in strip_zone_colors.values())
+        bulb['on'] = not nothing_lit
         save_bulbs()
         socketio.emit('bulb_updated', bulb)
 
@@ -730,10 +917,25 @@ def health():
 # --- 6. WebSockets ---
 @socketio.on('connect')
 def handle_connect():
+    global _active_clients
+    with _clients_lock:
+        _active_clients += 1
+        first = _active_clients == 1
+    # Wake the monitor immediately so a freshly opened UI gets accurate
+    # online/offline state in one sweep instead of waiting up to 12s.
+    if first:
+        _monitor_wakeup.set()
     socketio.emit('bulbs_state', list(bulbs.values()))
     broadcast_strip_state()
     socketio.emit('music_library_updated', _list_music_tracks())
     _music_broadcast()
+
+
+@socketio.on('disconnect')
+def handle_disconnect():
+    global _active_clients
+    with _clients_lock:
+        _active_clients = max(0, _active_clients - 1)
 
 
 if __name__ == '__main__':

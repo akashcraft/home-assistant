@@ -1,4 +1,4 @@
-import { useRef, useState } from 'react'
+import { useEffect, useRef, useState } from 'react'
 import {
   alpha,
   Box,
@@ -31,6 +31,9 @@ const SEGMENTS_LABELS: Record<SegmentsMode, string> = {
   mix: 'Mix',
 }
 
+const LS_INCLUDE_BULBS = 'library.includeBulbs'
+const LS_SEGMENTS_MODE = 'library.segmentsMode'
+
 type LibraryDrawerProps = {
   open: boolean
   isPhone: boolean
@@ -60,8 +63,23 @@ function LibraryDrawer({
   onStop,
   onLibraryChanged,
 }: LibraryDrawerProps) {
-  const [includeBulbs, setIncludeBulbs] = useState(true)
-  const [segmentsMode, setSegmentsMode] = useState<SegmentsMode>('mix')
+  const [includeBulbs, setIncludeBulbs] = useState<boolean>(() => {
+    const raw = localStorage.getItem(LS_INCLUDE_BULBS)
+    return raw === null ? true : raw === 'true'
+  })
+  const [segmentsMode, setSegmentsMode] = useState<SegmentsMode>(() => {
+    const raw = localStorage.getItem(LS_SEGMENTS_MODE)
+    return (SEGMENTS_MODES as readonly string[]).includes(raw ?? '')
+      ? (raw as SegmentsMode)
+      : 'mix'
+  })
+
+  useEffect(() => {
+    localStorage.setItem(LS_INCLUDE_BULBS, includeBulbs ? 'true' : 'false')
+  }, [includeBulbs])
+  useEffect(() => {
+    localStorage.setItem(LS_SEGMENTS_MODE, segmentsMode)
+  }, [segmentsMode])
   const [uploading, setUploading] = useState(false)
   const [pendingName, setPendingName] = useState<string | null>(null)
   const fileInputRef = useRef<HTMLInputElement | null>(null)

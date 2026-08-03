@@ -5,11 +5,10 @@ import {
   Box,
   Chip,
   CssBaseline,
-  IconButton,
   Stack,
   Typography,
 } from '@mui/material'
-import { TuneRounded } from '@mui/icons-material'
+import { LibraryMusicOutlined } from '@mui/icons-material'
 import { useMediaQuery } from '@mui/material'
 import { ThemeProvider, createTheme } from '@mui/material/styles'
 import { io, Socket } from 'socket.io-client'
@@ -27,6 +26,7 @@ export type Bulb = {
   on?: boolean
   brightness?: number
   color?: string
+  online?: boolean
 }
 
 type BulbSnapshot = {
@@ -36,6 +36,7 @@ type BulbSnapshot = {
   on: boolean
   brightness: number
   color: string
+  online?: boolean
 }
 
 const API_BASE_URL = 'http://192.168.2.27:8080'
@@ -91,7 +92,12 @@ function App() {
   const [musicTracks, setMusicTracks] = useState<MusicTrack[]>([])
   const [musicState, setMusicState] = useState<MusicState>({ playing: null, linked: false })
   const [libraryOpen, setLibraryOpen] = useState(false)
-  const [linkToLights, setLinkToLights] = useState(false)
+  const [linkToLights, setLinkToLights] = useState<boolean>(() => {
+    return localStorage.getItem('library.linkToLights') === 'true'
+  })
+  useEffect(() => {
+    localStorage.setItem('library.linkToLights', linkToLights ? 'true' : 'false')
+  }, [linkToLights])
 
   const selectedBulb = bulbs.find((bulb) => bulb.id === selectedBulbId) ?? bulbs[0]
   const activeBulbs = bulbs.filter((bulb) => bulb.on).length
@@ -189,10 +195,13 @@ function App() {
     }
   }
 
+  const isBulbOffline = (bulbId: number) =>
+    bulbs.find((item) => item.id === bulbId)?.online === false
+
   const handlePower = (bulbId: number, powerState: boolean) => {
     const bulb = bulbs.find((item) => item.id === bulbId)
 
-    if (!bulb) {
+    if (!bulb || bulb.online === false) {
       return
     }
 
@@ -202,7 +211,7 @@ function App() {
   const handleToggle = (bulbId: number) => {
     const bulb = bulbs.find((item) => item.id === bulbId)
 
-    if (!bulb) {
+    if (!bulb || bulb.online === false) {
       return
     }
 
@@ -213,12 +222,18 @@ function App() {
     if (bulbId === undefined || brightness === undefined) {
       return
     }
+    if (isBulbOffline(bulbId)) {
+      return
+    }
     updateBulb(bulbId, (item) => ({ ...item, brightness }))
     void postBulbCommand(bulbId, 'brightness', { brightness })
   }
 
   const handleColorChange = (bulbId?: number, color?: string) => {
     if (bulbId === undefined || color === undefined) {
+      return
+    }
+    if (isBulbOffline(bulbId)) {
       return
     }
     updateBulb(bulbId, (item) => ({ ...item, color }))
@@ -402,30 +417,20 @@ function App() {
 
             <Stack direction="row" spacing={1.25} sx={{ alignItems: 'center', flexWrap: 'wrap', justifyContent: 'flex-end' }}>
               <Chip
-                label={musicState.playing
-                  ? `Playing${musicState.linked ? ' · linked' : ''}`
-                  : `${musicTracks.length} track${musicTracks.length === 1 ? '' : 's'}`}
+                clickable
+                onClick={() => setLibraryOpen(true)}
+                icon={<LibraryMusicOutlined fontSize="small" />}
+                label={`${musicTracks.length} track${musicTracks.length === 1 ? '' : 's'}`}
                 sx={{
                   backgroundColor: alpha('#ffffff', 0.06),
                   color: 'text.primary',
                   border: '1px solid rgba(255,255,255,0.08)',
+                  height: 38,
+                  borderRadius: "1.5rem",
+                  padding: "0 0.25rem",
+                  alignItems: 'center',
                 }}
               />
-              <IconButton
-                aria-label="Open music library"
-                onClick={() => setLibraryOpen(true)}
-                sx={{
-                  width: 38,
-                  height: 38,
-                  borderRadius: '50%',
-                  backgroundColor: alpha('#ffffff', 0.06),
-                  border: '1px solid rgba(255,255,255,0.08)',
-                  color: 'text.primary',
-                  ':hover': { backgroundColor: alpha('#ffffff', 0.14) },
-                }}
-              >
-                <TuneRounded fontSize="small" />
-              </IconButton>
             </Stack>
           </Stack>
 
