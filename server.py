@@ -411,7 +411,9 @@ def _music_kill_locked():
 
 def _music_stop():
     with music_state.lock:
-        was_playing = music_state.process is not None
+        # Unlinked playback has no subprocess (browser-only audio), so the
+        # basename -- not the process -- is what says something was playing.
+        was_playing = music_state.basename is not None
         _music_kill_locked()
     if was_playing:
         _music_broadcast()
@@ -995,7 +997,7 @@ def stop_music_endpoint():
 def delete_music(basename):
     safe = _safe_basename(basename)
     with music_state.lock:
-        if music_state.basename == safe and music_state.process is not None:
+        if music_state.basename == safe:
             _music_kill_locked()
             was_playing = True
         else:

@@ -112,6 +112,13 @@ def run(song_path: str, json_path: Optional[str] = None):
     # each other instead of many seconds apart.
     print("READY", flush=True)
 
+    # Absorb the browser's <audio>.play() startup buffer (~200 ms). Without
+    # this, LEDs consistently lead the audio because the render loop starts
+    # the microsecond the server writes its HTTP response, while the
+    # browser still has to prime its audio buffer. Tune if it's off.
+    AUDIO_STARTUP_OFFSET_MS = 400
+    time.sleep(AUDIO_STARTUP_OFFSET_MS / 1000.0)
+
     frame_interval = 1.0 / FPS
     frame_index = 0
     start_perf = time.perf_counter()
