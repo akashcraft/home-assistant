@@ -1,4 +1,4 @@
-import { useEffect, useRef, useState } from 'react'
+import { useRef, useState } from 'react'
 import {
   alpha,
   Box,
@@ -9,12 +9,12 @@ import {
   Drawer as MuiDrawer,
   FormControlLabel,
   IconButton,
-  Radio,
   Stack,
   Typography,
 } from '@mui/material'
 import {
   CloseRounded,
+  DataObjectRounded,
   DeleteOutlineRounded,
   MusicNoteRounded,
   PlayArrowRounded,
@@ -22,18 +22,6 @@ import {
   UploadFileRounded,
 } from '@mui/icons-material'
 import type { MusicTrack } from './MusicTile'
-
-const SEGMENTS_MODES = ['all', 'zones', 'mix'] as const
-type SegmentsMode = (typeof SEGMENTS_MODES)[number]
-
-const SEGMENTS_LABELS: Record<SegmentsMode, string> = {
-  all: 'All',
-  zones: 'Segments Only',
-  mix: 'Mix',
-}
-
-const LS_INCLUDE_BULBS = 'library.includeBulbs'
-const LS_SEGMENTS_MODE = 'library.segmentsMode'
 
 type LibraryDrawerProps = {
   open: boolean
@@ -70,30 +58,19 @@ function LibraryDrawer({
   onStop,
   onLibraryChanged,
 }: LibraryDrawerProps) {
-  const [includeBulbs, setIncludeBulbs] = useState<boolean>(() => {
-    const raw = localStorage.getItem(LS_INCLUDE_BULBS)
-    return raw === null ? true : raw === 'true'
-  })
-  const [segmentsMode, setSegmentsMode] = useState<SegmentsMode>(() => {
-    const raw = localStorage.getItem(LS_SEGMENTS_MODE)
-    return (SEGMENTS_MODES as readonly string[]).includes(raw ?? '')
-      ? (raw as SegmentsMode)
-      : 'mix'
-  })
-
-  useEffect(() => {
-    localStorage.setItem(LS_INCLUDE_BULBS, includeBulbs ? 'true' : 'false')
-  }, [includeBulbs])
-  useEffect(() => {
-    localStorage.setItem(LS_SEGMENTS_MODE, segmentsMode)
-  }, [segmentsMode])
   const [uploading, setUploading] = useState(false)
   const [pendingName, setPendingName] = useState<string | null>(null)
-  const fileInputRef = useRef<HTMLInputElement | null>(null)
+  const audioInputRef = useRef<HTMLInputElement | null>(null)
+  const jsonInputRef = useRef<HTMLInputElement | null>(null)
 
-  const handleFilePick = () => {
+  const handleAudioPick = () => {
     if (uploading) return
-    fileInputRef.current?.click()
+    audioInputRef.current?.click()
+  }
+
+  const handleJsonPick = () => {
+    if (uploading) return
+    jsonInputRef.current?.click()
   }
 
   const handleFileChange = async (event: React.ChangeEvent<HTMLInputElement>) => {
@@ -107,8 +84,6 @@ function LibraryDrawer({
     try {
       const form = new FormData()
       form.append('audio', file)
-      form.append('include_bulbs', includeBulbs ? 'true' : 'false')
-      form.append('segments_mode', segmentsMode)
 
       const res = await fetch(`${apiBase}/api/music/upload`, {
         method: 'POST',
@@ -134,6 +109,49 @@ function LibraryDrawer({
     }
   }
 
+  const handleJsonChange = async (event: React.ChangeEvent<HTMLInputElement>) => {
+    const file = event.target.files?.[0]
+    event.target.value = ''
+    if (!file) return
+
+    // The server matches the JSON to a track by name, but catching the
+    // mismatch here lets the user confirm before anything is sent.
+    const stem = file.name.replace(/\.[^.]+$/, '')
+    const match = tracks.find((track) => track.basename === stem)
+    if (!match) {
+      window.alert(
+        `No track named "${stem}" in the library. Name the JSON exactly like its song (e.g. "${tracks[0]?.basename ?? 'song'}.json").`,
+      )
+      return
+    }
+    if (match.has_json && !window.confirm(`"${stem}" already has a timeline JSON. Overwrite it?`)) {
+      return
+    }
+
+    setUploading(true)
+    setPendingName(file.name)
+    try {
+      const form = new FormData()
+      form.append('json', file)
+
+      const res = await fetch(`${apiBase}/api/music/upload-json`, {
+        method: 'POST',
+        body: form,
+      })
+      if (!res.ok) {
+        const body = await res.json().catch(() => ({}))
+        window.alert(`JSON upload failed: ${body.error ?? res.statusText}`)
+        return
+      }
+      onLibraryChanged()
+    } catch (err) {
+      window.alert(`JSON upload failed: ${err instanceof Error ? err.message : String(err)}`)
+    } finally {
+      setUploading(false)
+      setPendingName(null)
+    }
+  }
+
   const handleDelete = async (basename: string) => {
     if (!window.confirm(`Delete "${basename}"? This removes the audio, album art and timeline JSON.`)) {
       return
@@ -152,6 +170,15 @@ function LibraryDrawer({
       window.alert(`Delete failed: ${err instanceof Error ? err.message : String(err)}`)
     }
   }
+
+  const uploadButtonSx = {
+    borderRadius: 3,
+    borderColor: 'rgba(255,255,255,0.14)',
+    color: '#ffffff',
+    textTransform: 'none',
+    fontWeight: 600,
+    ':hover': { borderColor: 'rgba(255,255,255,0.32)' },
+  } as const
 
   const cardSx = {
     borderRadius: '1.5rem',
@@ -230,94 +257,26 @@ function LibraryDrawer({
                   </Stack>
                 }
               />
-              <FormControlLabel
-                sx={{
-                  m: 0,
-                  px: 1,
-                  py: 0.25,
-                  borderRadius: 2,
-                  border: includeBulbs
-                    ? '1px solid rgba(138,180,255,0.5)'
-                    : '1px solid rgba(255,255,255,0.06)',
-                  background: includeBulbs ? alpha('#8ab4ff', 0.12) : 'transparent',
-                }}
-                control={
-                  <Checkbox
-                    size="small"
-                    checked={includeBulbs}
-                    onChange={(e) => setIncludeBulbs(e.target.checked)}
-                    sx={{
-                      color: 'rgba(255,255,255,0.35)',
-                      '&.Mui-checked': { color: '#8ab4ff' },
-                    }}
-                  />
-                }
-                label={
-                  <Typography variant="body2" sx={{ fontWeight: 500 }}>
-                    Include Bulbs
-                  </Typography>
-                }
-              />
-              <Box
-                sx={{
-                  display: 'grid',
-                  gridTemplateColumns: '1fr',
-                  gap: 1.25,
-                }}
-              >
-                {SEGMENTS_MODES.map((mode) => {
-                  const checked = segmentsMode === mode
-                  return (
-                    <FormControlLabel
-                      key={mode}
-                      sx={{
-                        m: 0,
-                        px: 1,
-                        py: 0.25,
-                        borderRadius: 2,
-                        border: checked
-                          ? '1px solid rgba(138,180,255,0.5)'
-                          : '1px solid rgba(255,255,255,0.06)',
-                        background: checked ? alpha('#8ab4ff', 0.12) : 'transparent',
-                      }}
-                      control={
-                        <Radio
-                          size="small"
-                          checked={checked}
-                          onChange={() => setSegmentsMode(mode)}
-                          sx={{
-                            color: 'rgba(255,255,255,0.35)',
-                            '&.Mui-checked': { color: '#8ab4ff' },
-                          }}
-                        />
-                      }
-                      label={
-                        <Typography variant="body2" sx={{ fontWeight: 500 }}>
-                          {SEGMENTS_LABELS[mode]}
-                        </Typography>
-                      }
-                    />
-                  )
-                })}
-              </Box>
             </Stack>
 
-            <Box sx={{ mt: 2, display: 'flex', alignItems: 'center', gap: 1.5 }}>
+            <Box sx={{ mt: 2, display: 'flex', alignItems: 'center', gap: 1.5, flexWrap: 'wrap' }}>
               <Button
                 variant="outlined"
                 startIcon={<UploadFileRounded />}
-                onClick={handleFilePick}
+                onClick={handleAudioPick}
                 disabled={uploading}
-                sx={{
-                  borderRadius: 3,
-                  borderColor: 'rgba(255,255,255,0.14)',
-                  color: '#ffffff',
-                  textTransform: 'none',
-                  fontWeight: 600,
-                  ':hover': { borderColor: 'rgba(255,255,255,0.32)' },
-                }}
+                sx={uploadButtonSx}
               >
-                {uploading ? 'Processing…' : 'Choose file'}
+                {uploading ? 'Uploading…' : 'Upload Music'}
+              </Button>
+              <Button
+                variant="outlined"
+                startIcon={<DataObjectRounded />}
+                onClick={handleJsonPick}
+                disabled={uploading}
+                sx={uploadButtonSx}
+              >
+                Upload JSON
               </Button>
               {pendingName ? (
                 <Typography variant="caption" sx={{ color: 'text.secondary' }} noWrap>
@@ -327,10 +286,17 @@ function LibraryDrawer({
             </Box>
 
             <input
-              ref={fileInputRef}
+              ref={audioInputRef}
               type="file"
               accept=".mp3,.wav,.m4a,.flac,.ogg,audio/*"
               onChange={handleFileChange}
+              style={{ display: 'none' }}
+            />
+            <input
+              ref={jsonInputRef}
+              type="file"
+              accept=".json,application/json"
+              onChange={handleJsonChange}
               style={{ display: 'none' }}
             />
           </Box>
@@ -389,6 +355,11 @@ function LibraryDrawer({
                         <Typography variant="body2" sx={{ fontWeight: 600 }} noWrap>
                           {track.basename}
                         </Typography>
+                        {!track.has_json && (
+                          <Typography variant="caption" sx={{ color: 'text.secondary' }} noWrap>
+                            No JSON Uploaded
+                          </Typography>
+                        )}
                       </Stack>
 
                       {(() => {

@@ -829,14 +829,13 @@ def list_music():
 
 @app.route('/api/music/upload', methods=['POST', 'OPTIONS'])
 def upload_music():
+    """Store the audio (and its embedded art) only. Timeline JSON is NOT
+    generated here -- librosa analysis is far too heavy for the Orange Pi.
+    Run engine/generate_timeline.py on a desktop and upload the result via
+    /api/music/upload-json."""
     file = request.files.get('audio')
     if file is None or not file.filename:
         return jsonify({'error': 'no audio file provided'}), 400
-
-    include_bulbs = str(request.form.get('include_bulbs', 'true')).lower() == 'true'
-    segments_mode = str(request.form.get('segments_mode', 'mix')).lower()
-    if segments_mode not in ('all', 'zones', 'mix'):
-        segments_mode = 'mix'
 
     ext = Path(file.filename).suffix.lower()
     if ext not in AUDIO_EXTS:
@@ -860,18 +859,6 @@ def upload_music():
         # the UI wants a distinct signal so it can window.alert() the user.
         pass
 
-    try:
-        _generate_timeline(audio_path, include_bulbs, segments_mode)
-    except Exception as e:
-        # Roll back audio + art so a broken track doesn't clutter the list.
-        for p in (audio_path, MUSIC_DIR / f"{base}.png"):
-            try:
-                if p.exists():
-                    p.unlink()
-            except Exception:
-                pass
-        return jsonify({'error': f'timeline generation failed: {e}'}), 500
-
     socketio.emit('music_library_updated', _list_music_tracks())
     return jsonify({
         'basename': base,
@@ -879,6 +866,42 @@ def upload_music():
         'has_art': art_ok,
         'has_json': (MUSIC_DIR / f"{base}.json").exists(),
     })
+
+
+@app.route('/api/music/upload-json', methods=['POST', 'OPTIONS'])
+def upload_music_json():
+    """Accept a timeline JSON generated elsewhere. It must be named after a
+    track already in the library (song.mp3 -> song.json); a mismatched name
+    is rejected so stray JSON can't pile up. Re-uploading overwrites."""
+    file = request.files.get('json')
+    if file is None or not file.filename:
+        return jsonify({'error': 'no JSON file provided'}), 400
+
+    if Path(file.filename).suffix.lower() != '.json':
+        return jsonify({'error': 'file must be a .json timeline'}), 400
+
+    base = _safe_basename(file.filename)
+    if _find_audio_file(base) is None:
+        return jsonify({
+            'error': f'no track named "{base}" in the library -- '
+                     'name the JSON exactly like its song',
+        }), 400
+
+    raw = file.read()
+    try:
+        json.loads(raw.decode('utf-8'))
+    except Exception as e:
+        return jsonify({'error': f'not valid JSON: {e}'}), 400
+
+    json_path = MUSIC_DIR / f"{base}.json"
+    existed = json_path.exists()
+    try:
+        json_path.write_bytes(raw)
+    except Exception as e:
+        return jsonify({'error': f'failed to save JSON: {e}'}), 500
+
+    socketio.emit('music_library_updated', _list_music_tracks())
+    return jsonify({'basename': base, 'replaced': existed})
 
 
 @app.route('/api/music/<basename>/art', methods=['GET', 'OPTIONS'])
