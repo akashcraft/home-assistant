@@ -429,6 +429,52 @@ def _stop_music_if_linked(reason: str = "user action"):
     _music_broadcast()
 
 
+def _wait_for_renderer_ready(proc, timeout: float) -> bool:
+    """Block until led_renderer prints 'READY' on stdout (or timeout).
+    Any earlier output is echoed so startup errors still surface in logs."""
+    import selectors
+    if proc.stdout is None:
+        return True
+    deadline = time.monotonic() + timeout
+    sel = selectors.DefaultSelector()
+    sel.register(proc.stdout, selectors.EVENT_READ)
+    try:
+        while True:
+            remaining = deadline - time.monotonic()
+            if remaining <= 0:
+                print("[music] renderer READY timeout")
+                return False
+            if proc.poll() is not None:
+                print(f"[music] renderer exited before READY (code {proc.returncode})")
+                return False
+            events = sel.select(timeout=min(remaining, 0.5))
+            if not events:
+                continue
+            line = proc.stdout.readline()
+            if not line:
+                return False
+            line = line.rstrip()
+            print(f"[renderer] {line}")
+            if line == "READY":
+                return True
+    finally:
+        try:
+            sel.unregister(proc.stdout)
+        except Exception:
+            pass
+
+
+def _drain_child_stdout(proc):
+    """Keep reading and echoing child stdout so its pipe never fills up."""
+    if proc.stdout is None:
+        return
+    try:
+        for line in proc.stdout:
+            print(f"[renderer] {line.rstrip()}")
+    except Exception:
+        pass
+
+
 def _music_watchdog(proc, basename: str):
     """Wait for the subprocess to end and clean up state so the UI flips
     back to the Play icon when the song finishes naturally."""
@@ -890,10 +936,18 @@ def play_music(basename):
         _music_kill_locked()
         if link:
             try:
+                # stdout=PIPE + line-buffered so we can wait for the
+                # renderer's "READY" heartbeat before the browser starts
+                # playing audio. Without this, LED frames lag audio by 2-5s
+                # on a Pi Zero 3 due to librosa/bulb_snapshot startup cost.
                 proc = subprocess.Popen(
-                    [sys.executable, str(ENGINE_DIR / "led_renderer.py"),
+                    [sys.executable, "-u", str(ENGINE_DIR / "led_renderer.py"),
                      str(audio), str(json_path)],
                     cwd=str(ENGINE_DIR),
+                    stdout=subprocess.PIPE,
+                    stderr=subprocess.STDOUT,
+                    bufsize=1,
+                    text=True,
                 )
             except Exception as e:
                 return jsonify({'error': f'failed to start renderer: {e}'}), 500
@@ -903,6 +957,15 @@ def play_music(basename):
         music_state.owner = owner
 
     if proc is not None:
+        # Block the HTTP response until the renderer says READY (or times
+        # out). The owning browser gets its 200 only after LEDs are one
+        # frame away from firing, which keeps audio & LEDs within a few ms.
+        ready = _wait_for_renderer_ready(proc, timeout=30.0)
+        if not ready:
+            _music_stop()
+            return jsonify({'error': 'renderer failed to become ready'}), 500
+        # Drain further stdout so the pipe never fills up and blocks the child.
+        Thread(target=_drain_child_stdout, args=(proc,), daemon=True).start()
         Thread(target=_music_watchdog, args=(proc, safe), daemon=True).start()
 
     _music_broadcast()

@@ -105,6 +105,13 @@ def run(song_path: str, json_path: Optional[str] = None):
     bulb_ctrl.snapshot()
     bulb_ctrl.start()
 
+    # Startup on a Pi Zero 3 takes several seconds (librosa + bulb snapshot +
+    # razer control). Signal the parent process that we are ready to render
+    # so the server can hold its HTTP response until now -- that keeps the
+    # browser's <audio>.play() and the first LED frame within a few ms of
+    # each other instead of many seconds apart.
+    print("READY", flush=True)
+
     frame_interval = 1.0 / FPS
     frame_index = 0
     start_perf = time.perf_counter()
