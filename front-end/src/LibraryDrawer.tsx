@@ -5,6 +5,7 @@ import {
   Button,
   Checkbox,
   Divider,
+  CircularProgress,
   Drawer as MuiDrawer,
   FormControlLabel,
   IconButton,
@@ -39,6 +40,8 @@ type LibraryDrawerProps = {
   isPhone: boolean
   tracks: MusicTrack[]
   playing: string | null
+  /** Basename currently loading (spinner in place of the play icon). */
+  loadingBasename?: string | null
   /** True when another browser owns playback -- disable play buttons here. */
   disablePlayback?: boolean
   linkToLights: boolean
@@ -56,6 +59,7 @@ function LibraryDrawer({
   isPhone,
   tracks,
   playing,
+  loadingBasename,
   disablePlayback,
   linkToLights,
   onLinkToLightsChange,
@@ -387,20 +391,31 @@ function LibraryDrawer({
                         </Typography>
                       </Stack>
 
-                      <IconButton
-                        size="small"
-                        aria-label={isPlaying ? 'Stop' : 'Play'}
-                        disabled={!isPlaying && !!disablePlayback}
-                        onClick={() => (isPlaying ? onStop() : onPlay(track.basename))}
-                        sx={{
-                          color: '#ffffff',
-                          backgroundColor: alpha('#ffffff', 0.08),
-                          ':hover': { backgroundColor: alpha('#ffffff', 0.16) },
-                          '&.Mui-disabled': { color: 'rgba(255,255,255,0.3)' },
-                        }}
-                      >
-                        {isPlaying ? <StopRounded fontSize="small" /> : <PlayArrowRounded fontSize="small" />}
-                      </IconButton>
+                      {(() => {
+                        const isLoading = loadingBasename === track.basename
+                        return (
+                          <IconButton
+                            size="small"
+                            aria-label={isPlaying ? 'Stop' : 'Play'}
+                            disabled={isLoading || (!isPlaying && !!disablePlayback)}
+                            onClick={() => (isPlaying ? onStop() : onPlay(track.basename))}
+                            sx={{
+                              color: '#ffffff',
+                              backgroundColor: alpha('#ffffff', 0.08),
+                              ':hover': { backgroundColor: alpha('#ffffff', 0.16) },
+                              '&.Mui-disabled': { color: 'rgba(255,255,255,0.3)' },
+                            }}
+                          >
+                            {isLoading ? (
+                              <CircularProgress size={16} thickness={5} sx={{ color: '#ffffff' }} />
+                            ) : isPlaying ? (
+                              <StopRounded fontSize="small" />
+                            ) : (
+                              <PlayArrowRounded fontSize="small" />
+                            )}
+                          </IconButton>
+                        )
+                      })()}
 
                       <IconButton
                         size="small"

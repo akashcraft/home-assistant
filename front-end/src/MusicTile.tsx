@@ -1,4 +1,4 @@
-import { alpha, Box, Card, Stack, Typography } from '@mui/material'
+import { alpha, Box, Card, CircularProgress, Stack, Typography } from '@mui/material'
 import {
   MusicNoteRounded,
   PlayArrowRounded,
@@ -15,6 +15,8 @@ export type MusicTrack = {
 type MusicTileProps = {
   track: MusicTrack
   isPlaying: boolean
+  /** True while the renderer / audio is starting up -- show a spinner. */
+  isLoading?: boolean
   /** Someone else's browser owns playback -- lock this tile out. */
   disabled?: boolean
   isPhone?: boolean
@@ -26,6 +28,7 @@ type MusicTileProps = {
 function MusicTile({
   track,
   isPlaying,
+  isLoading,
   disabled,
   isPhone,
   artUrl,
@@ -33,7 +36,7 @@ function MusicTile({
   onStop,
 }: MusicTileProps) {
   const artSrc = track.has_art ? artUrl(track.basename) : null
-  const locked = !!disabled && !isPlaying
+  const locked = (!!disabled && !isPlaying) || !!isLoading
 
   return (
     <Card
@@ -138,6 +141,7 @@ function MusicTile({
         <Stack
           onClick={(event) => {
             event.stopPropagation()
+            if (isLoading) return
             if (isPlaying) {
               onStop()
             } else {
@@ -157,11 +161,13 @@ function MusicTile({
             backgroundColor: alpha('#ffffff', 0.12),
             border: '1px solid rgba(255,255,255,0.14)',
             ':hover': {
-              cursor: 'pointer',
+              cursor: isLoading ? 'wait' : 'pointer',
             },
           }}
         >
-          {isPlaying ? (
+          {isLoading ? (
+            <CircularProgress size={20} thickness={5} sx={{ color: '#ffffff' }} />
+          ) : isPlaying ? (
             <StopRounded sx={{ color: '#ffffff' }} />
           ) : (
             <PlayArrowRounded sx={{ color: '#ffffff' }} />

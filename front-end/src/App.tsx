@@ -103,6 +103,7 @@ function App() {
   const [musicTracks, setMusicTracks] = useState<MusicTrack[]>([])
   const [musicState, setMusicState] = useState<MusicState>({ playing: null, linked: false, owner: null })
   const [libraryOpen, setLibraryOpen] = useState(false)
+  const [loadingBasename, setLoadingBasename] = useState<string | null>(null)
   const [linkToLights, setLinkToLights] = useState<boolean>(() => {
     return localStorage.getItem('library.linkToLights') === 'true'
   })
@@ -279,6 +280,9 @@ function App() {
       window.alert('Music is already playing on another device.')
       return
     }
+    // Show a spinner in the tile's / drawer row's play button while the
+    // server waits for led_renderer's READY signal (a few seconds on Pi).
+    setLoadingBasename(basename)
     try {
       const res = await fetch(`${API_BASE_URL}/api/music/${encodeURIComponent(basename)}/play`, {
         method: 'POST',
@@ -304,6 +308,8 @@ function App() {
       }
     } catch (err) {
       window.alert(`Playback failed: ${err instanceof Error ? err.message : String(err)}`)
+    } finally {
+      setLoadingBasename(null)
     }
   }
 
@@ -510,6 +516,7 @@ function App() {
                 key={track.basename}
                 track={track}
                 isPlaying={musicState.playing === track.basename}
+                isLoading={loadingBasename === track.basename}
                 disabled={isBusyElsewhere}
                 isPhone={isPhone}
                 artUrl={artUrl}
@@ -525,6 +532,7 @@ function App() {
           isPhone={isPhone}
           tracks={musicTracks}
           playing={musicState.playing}
+          loadingBasename={loadingBasename}
           disablePlayback={isBusyElsewhere}
           linkToLights={linkToLights}
           onLinkToLightsChange={setLinkToLights}
