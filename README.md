@@ -78,6 +78,8 @@ For a production deploy, `npm run build` and serve the `dist/` folder from any s
 
 > [!IMPORTANT]
 > Update `API_BASE_URL` in `front-end/src/App.tsx` and `front-end/src/Drawer.tsx` to your server's IP.
+>
+> Set your LED strip's LAN IP once in `engine/strip_config.py` and in `server.py` (`STRIP_IP`).
 
 ## Changing Bulb Defaults
 Bulb state lives in `bulb_state.json` at the project root. First launch creates it from the defaults baked into `server.py`. Edit the file (or the `DEFAULT_BULBS` dict in `server.py`) to change the IP list, names, or starting colours. Restart `server.py` to reload.
@@ -87,7 +89,7 @@ Example entry:
 "4": {
   "id": 4,
   "name": "Living Room Bulb",
-  "ip": "192.168.2.28",
+  "ip": "192.168.1.83",
   "on": false,
   "brightness": 100,
   "color": "#ff680a"

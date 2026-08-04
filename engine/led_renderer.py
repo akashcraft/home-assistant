@@ -23,13 +23,10 @@ from typing import List, Optional
 from audio_analyzer import AudioAnalyzer
 from bulb_controller import BulbController, color_to_bulb
 from led_patterns import PATTERNS, PatternContext, resolve_segments
+from strip_config import STRIP_IP as IP, STRIP_PORT as PORT, STRIP_PIXELS as PIXELS, STRIP_FPS as FPS
 
 STRIP_ID = 1
 BULB_IDS = (2, 3, 4, 5)
-IP = "192.168.2.30"
-PORT = 4003
-PIXELS = 45
-FPS = 30
 
 
 def checksum(packet: List[int]) -> int:

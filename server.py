@@ -41,11 +41,11 @@ STATE_FILE = Path(__file__).with_name('bulb_state.json')
 STATE_LOCK = Lock()
 
 DEFAULT_BULBS = {
-    "1": {"id": 1, "name": "Main Light", "ip": "192.168.2.30", "on": False, "brightness": 100, "color": "#ff0000"},
-    "2": {"id": 2, "name": "Kitchen Bulb 1", "ip": "192.168.2.25", "on": False, "brightness": 100, "color": "#ff0000"},
-    "3": {"id": 3, "name": "Kitchen Bulb 2", "ip": "192.168.2.26", "on": False, "brightness": 100, "color": "#ff0000"},
-    "4": {"id": 4, "name": "Living Room Bulb", "ip": "192.168.2.28", "on": False, "brightness": 100, "color": "#ff0000"},
-    "5": {"id": 5, "name": "Hallway Bulb", "ip": "192.168.2.29", "on": False, "brightness": 100, "color": "#ff0000"},
+    "1": {"id": 1, "name": "Main Light", "ip": "192.168.1.92", "on": False, "brightness": 100, "color": "#ff0000"},
+    "2": {"id": 2, "name": "Kitchen Bulb 1", "ip": "192.168.1.116", "on": False, "brightness": 100, "color": "#ff0000"},
+    "3": {"id": 3, "name": "Kitchen Bulb 2", "ip": "192.168.1.138", "on": False, "brightness": 100, "color": "#ff0000"},
+    "4": {"id": 4, "name": "Living Room Bulb", "ip": "192.168.1.83", "on": False, "brightness": 100, "color": "#ff0000"},
+    "5": {"id": 5, "name": "Hallway Bulb", "ip": "192.168.1.73", "on": False, "brightness": 100, "color": "#ff0000"},
 }
 
 def load_bulbs():
@@ -143,10 +143,10 @@ Thread(target=_bulb_monitor_loop, daemon=True).start()
 
 
 # --- 2b. Strip per-segment control (id=1 only) ----------------------------
-# The 45-pixel strip at 192.168.2.30 speaks the "razer" UDP protocol on port 4003.
+# The 45-pixel strip speaks the "razer" UDP protocol on port 4003.
 # See engine/led_player.py + engine/led_patterns.py for the source of truth on
 # packet format and zone layout; the numbers here must stay in sync with them.
-STRIP_IP = "192.168.2.30"
+STRIP_IP = "192.168.1.92"
 STRIP_PORT = 4003
 STRIP_PIXELS = 45
 # Inclusive [start, end] pixel indices per named zone.

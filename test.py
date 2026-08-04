@@ -1,8 +1,7 @@
 # from govee.api.lan import power, brightness, color
 
 # # Manually define your device's local IP
-# DEVICE_IP_1 = "192.168.2.30"
-# DEVICE_IP_2 = "192.168.2.26"
+# DEVICE_IP_1 = "192.168.1.92"
 
 # # 1. Turn the device ON
 # power.send_power(
@@ -28,7 +27,7 @@ import socket
 import time
 
 
-IP = "192.168.2.30"
+IP = "192.168.1.92"
 PORT = 4003
 PIXELS = 45
 FPS = 20

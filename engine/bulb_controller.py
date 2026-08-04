@@ -2,7 +2,7 @@
 Talks to the Govee LAN bulbs (ids 2..5 in ../bulb_state.json) during song
 playback and restores them to their previous state when playback ends.
 
-The strip at 192.168.2.30 (id 1) is driven directly by led_player.py -- this
+The strip is driven directly by led_player.py -- this
 module is only for the color+brightness-only bulbs. Kitchen has two bulbs
 (ids 2 and 3); living room and hallway are ids 4 and 5.
 
