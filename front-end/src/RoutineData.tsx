@@ -12,17 +12,17 @@ export type RoutineData = {
 export const routineData: RoutineData[] = [
   {
     id: 1,
-    name: 'Kitchen',
+    name: 'Bulbs',
     actions: [
       {
         bulbId: 2,
-        actionType: 'color',
-        value: '#ffffff',
+        actionType: 'brightness',
+        value: 100,
       },
       {
         bulbId: 3,
-        actionType: 'color',
-        value: '#ffffff',
+        actionType: 'brightness',
+        value: 100,
       },
     ]
   },

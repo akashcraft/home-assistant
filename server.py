@@ -42,10 +42,8 @@ STATE_LOCK = Lock()
 
 DEFAULT_BULBS = {
     "1": {"id": 1, "name": "Main Light", "ip": "192.168.2.30", "on": False, "brightness": 100, "color": "#ff0000"},
-    "2": {"id": 2, "name": "Kitchen Bulb 1", "ip": "192.168.2.25", "on": False, "brightness": 100, "color": "#ff0000"},
-    "3": {"id": 3, "name": "Kitchen Bulb 2", "ip": "192.168.2.26", "on": False, "brightness": 100, "color": "#ff0000"},
-    "4": {"id": 4, "name": "Living Room Bulb", "ip": "192.168.2.28", "on": False, "brightness": 100, "color": "#ff0000"},
-    "5": {"id": 5, "name": "Hallway Bulb", "ip": "192.168.2.29", "on": False, "brightness": 100, "color": "#ff0000"},
+    "2": {"id": 2, "name": "Bulb 1", "ip": "192.168.2.25", "on": False, "brightness": 100, "color": "#ff0000"},
+    "3": {"id": 3, "name": "Bulb 2", "ip": "192.168.2.26", "on": False, "brightness": 100, "color": "#ff0000"},
 }
 
 def load_bulbs():
