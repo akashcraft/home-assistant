@@ -89,25 +89,6 @@ Example entry:
 
 The 45-pixel strip zones are defined in `server.py` (`STRIP_ZONES`) and mirrored in `engine/led_patterns.py`. Both must stay in sync if you change pixel ranges. The code is reverse engineered thanks to https://github.com/nicolasdeory/govee-realtime-control
 
-## Music Engine
-`engine/generate_timeline.py` analyses a song (tempo, beats, RMS, HPSS) and writes a JSON timeline of LED events. `engine/led_player.py` plays the mp3 and drives the strip + bulbs in sync at ~30 FPS. `engine/play_music.py` is a small `pygame.mixer` wrapper used when the light show is disabled.
-
-Gaps between events send a true black frame, and razer mode is re-asserted every `RAZER_KEEPALIVE_SEC` (2s) while the player runs. Without the keepalive a dark stretch would let razer mode lapse and the strip would re-light itself in its previous govee colour mid-song - black frames on their own don't seem to count as activity. If that ever comes back, `IDLE_LEVEL` in `led_player.py` raises the floor for "off" pixels from 0 to 1, which keeps every frame non-zero at a level that is nearly invisible.
-
-Uploads from the Library drawer save the audio + extracted `.png` album art + generated `.json` timeline into `/music/`. Delete removes all three.
-
-### Effect Editor
-The auto-generated timeline is a first draft. The `{ }` button on a track row in the Library drawer opens an editor for it in a new tab (`#/effects/<track>`):
-
-- **Left** - the effect palette. Drag an effect onto a lane to add it, or tap it and then tap a lane.
-- **Right** - settings for the selected event: pattern, target device, start/end, segments, colour and that pattern's own parameters. Save overwrites `<track>.json`; Cancel warns if there are unsaved changes before closing the tab.
-- **Bottom** - one lane per device, taken from `bulb_state.json`. Drag events to move them (vertically too, to retarget a device), drag their edges to resize, `Del` to remove, `⌘Z`/`⌘⇧Z` to undo/redo. Click anywhere on the ruler or empty lane space to drop the playhead there; a dashed ghost head tracks the cursor with the time it would jump to, and `←`/`→` nudge it 100 ms at a time (`⇧` for 1 s), pausing playback so it stays parked where you left it. **Snap 100 ms** in the timeline header rounds every move, resize and drop to a tenth of a second (off by default). Overlapping events are outlined in red, since the player only renders the last match.
-  - **Selecting several**: drag across empty lane space to rubber-band a selection, or `⌥`-drag when the lane is too packed to find a gap. `⇧`-click adds or removes one, `⌘A` takes the lot, `Esc` clears. `Del` removes the whole selection in one undo step, and dragging any member moves the set together.
-
-**Sync Lights** (toggle in the timeline header) runs the timeline on the real hardware while the song plays in the browser: `engine/led_preview.py` renders the same patterns as `led_player.py` against a wall clock instead of an audio clock. It previews what's on screen, unsaved edits included, so nothing has to be written to disk first. Playback starts only once the renderer reports ready, so the two stay in step; pausing, closing the tab, or touching a light in the main UI stops it, and the bulbs are restored exactly as they are after a normal light show. Seeking mid-playback relaunches the renderer at the new offset, so the lights take a moment to catch up.
-
-Segments accept anything `resolve_segments()` in `engine/led_patterns.py` understands: `all`, zone names, single pixels, `2-7` ranges, or a comma-separated mix like `Table, 20-24, Final`. **Pixel indices are 0-based** (`0-44` on the 45-pixel strip), matching the JSON and the engine. Saving a track that is currently playing does not affect the running player - it loaded its copy at launch.
-
 ## Who can use this?
 You are free to download and edit the source code files however you like.
 Should you wish to publish this in your project or socials, please provide appropriate credits.
