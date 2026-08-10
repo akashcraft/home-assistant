@@ -195,11 +195,13 @@ def pattern_scramble(buffer, ctx: PatternContext):
 
 
 def pattern_stack(buffer, ctx: PatternContext):
-    """Segments fill up one by one (progress bar style)."""
+    """Segments fill up one by one (progress bar style). `reverse` fills from
+    the far end of the selection back toward its start instead."""
     n = len(ctx.segments)
     filled = int(ctx.progress * n)
+    order = list(reversed(ctx.segments)) if ctx.params.get("reverse") else ctx.segments
     for i in range(min(filled + 1, n)):
-        buffer[ctx.segments[i]] = ctx.color
+        buffer[order[i]] = ctx.color
 
 
 def pattern_audio_spectrum(buffer, ctx: PatternContext):

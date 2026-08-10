@@ -36,6 +36,23 @@ PORT = 4003
 PIXELS = 45
 FPS = 30
 
+# Razer mode times out unless the strip keeps hearing from us, and an all-zero
+# frame doesn't appear to count as activity -- which is why gaps in a timeline
+# used to end with the strip re-lighting itself in its old govee colour. So we
+# send a genuine black frame for gaps and re-assert razer mode on a timer
+# instead of relying on the frames alone to hold the connection open.
+RAZER_KEEPALIVE_SEC = 2.0
+
+# Floor for "off" pixels. 0 is true black. If gaps ever start reverting to the
+# previous colour again, raise this to 1: the frame stays non-zero (and so
+# unmistakably live) at a level that is still essentially invisible.
+IDLE_LEVEL = 0
+IDLE_FRAME = [(IDLE_LEVEL, IDLE_LEVEL, IDLE_LEVEL)] * PIXELS
+
+
+def is_black(buffer) -> bool:
+    return all(r == 0 and g == 0 and b == 0 for r, g, b in buffer)
+
 
 def checksum(packet: List[int]) -> int:
     value = 0
@@ -93,25 +110,19 @@ def needs_audio_analysis(events: List[dict]) -> bool:
 
 # --- Main render loop ---------------------------------------------------------
 
-def run(song_path: str, json_path: Optional[str] = None):
-    if json_path is None:
-        base, _ = os.path.splitext(song_path)
-        json_path = base + ".json"
+def render_timeline(events: List[dict], audio_analyzer, elapsed_ms_fn, is_running_fn):
+    """Drive the strip + bulbs from a timeline until is_running_fn() goes False.
 
-    events = load_timeline(json_path)
-    print(f"Loaded {len(events)} events from {json_path}")
-
+    The clock is injected: led_player feeds it pygame's audio position, while
+    led_preview.py feeds it a wall clock so the effect editor can sync the
+    lights to audio playing in the browser instead. Owns the strip socket and
+    the bulb controller, and always blanks + restores on the way out."""
     events_by_id = split_by_id(events)
     strip_events = events_by_id.get(STRIP_ID, [])
     bulb_event_streams = {bid: events_by_id.get(bid, []) for bid in BULB_IDS}
     bulb_active_counts = {bid: len(evs) for bid, evs in bulb_event_streams.items() if evs}
     if bulb_active_counts:
         print(f"Bulb events: {bulb_active_counts}")
-
-    audio_analyzer = None
-    if needs_audio_analysis(events):
-        print("Loading waveform for audio_spectrum analysis...")
-        audio_analyzer = AudioAnalyzer(song_path)
 
     sock = socket.socket(socket.AF_INET, socket.SOCK_DGRAM)
     sock.sendto(control(True), (IP, PORT))
@@ -120,21 +131,16 @@ def run(song_path: str, json_path: Optional[str] = None):
     bulb_ctrl.snapshot()
     bulb_ctrl.start()
 
-    pygame.mixer.init()
-    pygame.mixer.music.load(song_path)
-
     frame_interval = 1.0 / FPS
     frame_index = 0
     next_tick = time.perf_counter()
+    next_keepalive = next_tick + RAZER_KEEPALIVE_SEC
     last_event_id = None
     last_bulb_event_id: dict = {bid: None for bid in BULB_IDS}
 
-    pygame.mixer.music.play()
-    print("Playing. Ctrl+C to stop early.")
-
     try:
-        while pygame.mixer.music.get_busy():
-            elapsed_ms = pygame.mixer.music.get_pos()  # ms since play() was called
+        while is_running_fn():
+            elapsed_ms = elapsed_ms_fn()
             if elapsed_ms < 0:
                 elapsed_ms = 0
 
@@ -179,7 +185,17 @@ def run(song_path: str, json_path: Optional[str] = None):
                 else:
                     print(f"Warning: unknown pattern '{event['pattern']}'")
 
+            # IDLE_LEVEL 0 sends the buffer untouched; raising it swaps a fully
+            # dark frame -- a gap, or an event that paints nothing this tick --
+            # for the non-zero floor.
+            if IDLE_LEVEL and is_black(buffer):
+                buffer = IDLE_FRAME
             sock.sendto(frame(buffer), (IP, PORT))
+
+            now = time.perf_counter()
+            if now >= next_keepalive:
+                sock.sendto(control(True), (IP, PORT))
+                next_keepalive = now + RAZER_KEEPALIVE_SEC
 
             # Bulbs: treat each as a single-pixel strip and reuse the pattern
             # engine. Only hold/pulse/fade/beats/scramble/rainbow_jump/hold-style
@@ -230,7 +246,6 @@ def run(song_path: str, json_path: Optional[str] = None):
     except KeyboardInterrupt:
         print("Stopped by user.")
     finally:
-        pygame.mixer.music.stop()
         sock.sendto(frame([(0, 0, 0)] * PIXELS), (IP, PORT))
         sock.sendto(control(False), (IP, PORT))
         try:
@@ -238,6 +253,36 @@ def run(song_path: str, json_path: Optional[str] = None):
             bulb_ctrl.restore()
         except Exception as e:
             print(f"[bulbs] cleanup error: {e}")
+
+
+def run(song_path: str, json_path: Optional[str] = None):
+    if json_path is None:
+        base, _ = os.path.splitext(song_path)
+        json_path = base + ".json"
+
+    events = load_timeline(json_path)
+    print(f"Loaded {len(events)} events from {json_path}")
+
+    audio_analyzer = None
+    if needs_audio_analysis(events):
+        print("Loading waveform for audio_spectrum analysis...")
+        audio_analyzer = AudioAnalyzer(song_path)
+
+    pygame.mixer.init()
+    pygame.mixer.music.load(song_path)
+    pygame.mixer.music.play()
+    print("Playing. Ctrl+C to stop early.")
+
+    try:
+        render_timeline(
+            events,
+            audio_analyzer,
+            # ms since play() was called
+            elapsed_ms_fn=pygame.mixer.music.get_pos,
+            is_running_fn=pygame.mixer.music.get_busy,
+        )
+    finally:
+        pygame.mixer.music.stop()
 
 
 if __name__ == "__main__":

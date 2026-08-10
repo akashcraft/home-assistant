@@ -18,6 +18,7 @@ import { routineData } from './RoutineData'
 import RoutineTile from './RoutineTile'
 import MusicTile, { type MusicTrack } from './MusicTile'
 import LibraryDrawer from './LibraryDrawer'
+import { API_BASE_URL } from './config'
 
 export type Bulb = {
   id?: number
@@ -38,8 +39,6 @@ type BulbSnapshot = {
   color: string
   online?: boolean
 }
-
-const API_BASE_URL = 'http://192.168.2.27:8080'
 
 const darkTheme = createTheme({
   palette: {

@@ -14,6 +14,7 @@ import {
 } from '@mui/material'
 import {
   CloseRounded,
+  DataObjectRounded,
   DeleteOutlineRounded,
   MusicNoteRounded,
   PlayArrowRounded,
@@ -21,6 +22,7 @@ import {
   UploadFileRounded,
 } from '@mui/icons-material'
 import type { MusicTrack } from './MusicTile'
+import { effectEditorUrl } from './config'
 
 const SEGMENTS_MODES = ['all', 'zones', 'mix'] as const
 type SegmentsMode = (typeof SEGMENTS_MODES)[number]
@@ -125,6 +127,11 @@ function LibraryDrawer({
       setUploading(false)
       setPendingName(null)
     }
+  }
+
+  const handleEditEffects = (basename: string) => {
+    // New tab so the drawer (and any playback) is left untouched.
+    window.open(effectEditorUrl(basename), '_blank')
   }
 
   const handleDelete = async (basename: string) => {
@@ -383,6 +390,35 @@ function LibraryDrawer({
                           {track.basename}
                         </Typography>
                       </Stack>
+
+                      <IconButton
+                        size="small"
+                        aria-label="Edit effects"
+                        disabled={!track.has_json}
+                        title={
+                          track.has_json
+                            ? 'Edit the Effect Timeline'
+                            : 'No timeline JSON for this track'
+                        }
+                        onClick={() => handleEditEffects(track.basename)}
+                        sx={{
+                          color: '#8ab4ff',
+                          backgroundColor: alpha('#8ab4ff', 0.12),
+                          border: '1px solid rgba(138,180,255,0.28)',
+                          borderRadius: '0.85rem',
+                          px: 0.9,
+                          fontSize: '0.78rem',
+                          fontWeight: 700,
+                          ':hover': { backgroundColor: alpha('#8ab4ff', 0.22) },
+                          '&.Mui-disabled': {
+                            color: 'rgba(255,255,255,0.25)',
+                            backgroundColor: alpha('#ffffff', 0.04),
+                            border: '1px solid rgba(255,255,255,0.06)',
+                          },
+                        }}
+                      >
+                        <DataObjectRounded fontSize="small" />
+                      </IconButton>
 
                       <IconButton
                         size="small"

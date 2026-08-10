@@ -1,11 +1,13 @@
 import base64
 import json
+import os
 import platform
 import re
 import signal
 import socket as socket_lib
 import subprocess
 import sys
+import tempfile
 import time
 from io import BytesIO
 from pathlib import Path
@@ -330,10 +332,14 @@ AUDIO_EXTS = {".mp3", ".wav", ".m4a", ".flac", ".ogg"}
 
 
 class MusicPlayback:
-    """Currently-running music process, if any. Only one plays at a time."""
+    """Currently-running music process, if any. Only one plays at a time.
+    The effect editor's light preview takes the same slot -- it drives the
+    same hardware, so it has to be mutually exclusive with playback."""
     process = None  # subprocess.Popen
     basename = None
     linked = False
+    preview = False
+    preview_path = None  # temp timeline written for a preview, deleted on stop
     lock = Lock()
 
 
@@ -367,6 +373,7 @@ def _music_broadcast():
         payload = {
             "playing": music_state.basename,
             "linked": music_state.linked,
+            "preview": music_state.preview,
         }
     socketio.emit("music_updated", payload)
 
@@ -392,9 +399,16 @@ def _music_kill_locked():
                     proc.kill()
         except Exception as e:
             print(f"[music] stop error: {e}")
+    if music_state.preview_path is not None:
+        try:
+            Path(music_state.preview_path).unlink(missing_ok=True)
+        except Exception as e:
+            print(f"[music] preview cleanup failed: {e}")
     music_state.process = None
     music_state.basename = None
     music_state.linked = False
+    music_state.preview = False
+    music_state.preview_path = None
     # led_player sends razer control(False) in its finally block, so the
     # strip is back in govee mode. Sync our flags so subsequent user actions
     # take the govee path immediately without stale razer state.
@@ -429,9 +443,16 @@ def _music_watchdog(proc, basename: str):
     proc.wait()
     with music_state.lock:
         if music_state.process is proc and music_state.basename == basename:
+            if music_state.preview_path is not None:
+                try:
+                    Path(music_state.preview_path).unlink(missing_ok=True)
+                except Exception as e:
+                    print(f"[music] preview cleanup failed: {e}")
             music_state.process = None
             music_state.basename = None
             music_state.linked = False
+            music_state.preview = False
+            music_state.preview_path = None
             emit_after = True
         else:
             emit_after = False
@@ -526,6 +547,158 @@ def _generate_timeline(audio_path: Path, include_bulbs: bool, segments_mode: str
         )
 
 
+# --- 2d. Timeline editing (effect editor) -------------------------------
+try:
+    if str(ENGINE_DIR) not in sys.path:
+        sys.path.append(str(ENGINE_DIR))
+    from led_patterns import PATTERNS as _LED_PATTERNS
+    KNOWN_PATTERNS = tuple(_LED_PATTERNS.keys())
+except Exception as e:  # engine module unavailable -- skip pattern validation
+    print(f"[timeline] pattern list unavailable, validation relaxed: {e}")
+    KNOWN_PATTERNS = ()
+
+
+def _timeline_devices():
+    """Lane rows for the editor -- exactly the devices this server drives,
+    from bulb_state.json. Device id 1 is the strip. A timeline may still
+    reference ids beyond these (generate_timeline.py can emit 2..5); the
+    editor adds a lane for those on its own when the events exist."""
+    devices = []
+    for key, bulb in bulbs.items():
+        try:
+            dev_id = int(bulb.get("id", key))
+        except (TypeError, ValueError):
+            continue
+        devices.append({
+            "id": dev_id,
+            "name": bulb.get("name") or (f"Bulb {dev_id}" if dev_id != 1 else "Main Light"),
+            "kind": "strip" if dev_id == 1 else "bulb",
+            "managed": True,
+        })
+    return sorted(devices, key=lambda d: d["id"])
+
+
+def _clean_rgb(value, index: int, field: str = "color"):
+    if not isinstance(value, (list, tuple)) or len(value) != 3:
+        raise ValueError(f"event {index}: {field} must be [r, g, b]")
+    out = []
+    for channel in value:
+        try:
+            out.append(max(0, min(255, int(round(float(channel))))))
+        except (TypeError, ValueError):
+            raise ValueError(f"event {index}: {field} channels must be numbers")
+    return out
+
+
+def _clean_segments(value, index: int):
+    """Accepts "all", a zone name, "2-7", a comma-separated combo of those,
+    or an explicit list of pixel indices. Rejects anything the pattern engine
+    would choke on -- an out-of-range index crashes led_player mid-song."""
+    zone_names = {name.lower() for name in STRIP_ZONES}
+
+    def check_index(raw_idx):
+        try:
+            idx = int(str(raw_idx).strip())
+        except (TypeError, ValueError):
+            raise ValueError(f"event {index}: '{raw_idx}' is not a pixel index")
+        if not 0 <= idx < STRIP_PIXELS:
+            raise ValueError(
+                f"event {index}: pixel {idx} is outside 0-{STRIP_PIXELS - 1}")
+        return idx
+
+    if isinstance(value, (list, tuple)):
+        return [check_index(v) for v in value]
+
+    if not isinstance(value, str):
+        raise ValueError(f"event {index}: segments must be a string or list")
+
+    text = value.strip()
+    if not text:
+        raise ValueError(f"event {index}: segments is empty")
+
+    for token in text.split(","):
+        token = token.strip()
+        if not token:
+            raise ValueError(f"event {index}: empty segment in '{text}'")
+        lower = token.lower()
+        if lower == "all" or lower in zone_names:
+            continue
+        if "-" in token:
+            lo, hi = token.split("-", 1)
+            lo_idx, hi_idx = check_index(lo), check_index(hi)
+            if lo_idx > hi_idx:
+                raise ValueError(f"event {index}: range '{token}' is backwards")
+            continue
+        check_index(token)
+    return text
+
+
+def _clean_timeline_event(raw, index: int):
+    """Normalize one editor event into the on-disk shape led_player expects.
+    Key order matches generate_timeline.py so saved files stay diff-friendly."""
+    if not isinstance(raw, dict):
+        raise ValueError(f"event {index} is not an object")
+
+    try:
+        dev_id = int(raw.get("id", 1))
+    except (TypeError, ValueError):
+        raise ValueError(f"event {index}: id must be a number")
+
+    pattern = str(raw.get("pattern", "")).strip()
+    if not pattern:
+        raise ValueError(f"event {index}: missing pattern")
+    if KNOWN_PATTERNS and pattern not in KNOWN_PATTERNS:
+        raise ValueError(f"event {index}: unknown pattern '{pattern}'")
+
+    try:
+        start_ms = int(round(float(raw.get("start_ms", 0))))
+        end_ms = int(round(float(raw.get("end_ms", 0))))
+    except (TypeError, ValueError):
+        raise ValueError(f"event {index}: start_ms/end_ms must be numbers")
+    start_ms = max(0, start_ms)
+    if end_ms <= start_ms:
+        raise ValueError(f"event {index}: end_ms must be after start_ms")
+
+    params = raw.get("params", {})
+    if params is None:
+        params = {}
+    if not isinstance(params, dict):
+        raise ValueError(f"event {index}: params must be an object")
+
+    cleaned = {
+        "id": dev_id,
+        "pattern": pattern,
+        "start_ms": start_ms,
+        "end_ms": end_ms,
+    }
+    # Bulbs are single points -- they carry no segments key at all.
+    if dev_id == 1:
+        cleaned["segments"] = _clean_segments(raw.get("segments", "all"), index)
+    cleaned["color"] = _clean_rgb(raw.get("color", [255, 255, 255]), index)
+    cleaned["params"] = params
+    return cleaned
+
+
+def _clean_timeline(payload):
+    events = payload.get("events") if isinstance(payload, dict) else payload
+    if not isinstance(events, list):
+        raise ValueError("payload must contain an 'events' list")
+    if not events:
+        raise ValueError("timeline has no events")
+    cleaned = [_clean_timeline_event(e, i) for i, e in enumerate(events)]
+    cleaned.sort(key=lambda e: (e["start_ms"], e["id"]))
+    return {"events": cleaned}
+
+
+def _write_timeline(json_path: Path, timeline: dict) -> None:
+    """Write via a temp file + atomic replace so a failed write can never
+    leave a half-written timeline behind for the player to load."""
+    tmp_path = json_path.with_suffix(".json.tmp")
+    with open(tmp_path, "w") as f:
+        json.dump(timeline, f, indent=2)
+    os.replace(tmp_path, json_path)
+
+
 def strip_apply_power(on):
     """Power the strip on/off via govee. Razer 'all-black' doesn't stick in
     hardware -- the strip re-lights itself after a moment -- so real off has
@@ -617,7 +790,7 @@ def handle_preflight():
 def add_cors_headers(response):
     response.headers['Access-Control-Allow-Origin'] = '*'
     response.headers['Access-Control-Allow-Headers'] = 'Content-Type'
-    response.headers['Access-Control-Allow-Methods'] = 'GET, POST, DELETE, OPTIONS'
+    response.headers['Access-Control-Allow-Methods'] = 'GET, POST, PUT, DELETE, OPTIONS'
     return response
 
 
@@ -834,6 +1007,78 @@ def get_music_art(basename):
     return send_from_directory(str(MUSIC_DIR), f"{safe}.png")
 
 
+@app.route('/api/music/<basename>/audio', methods=['GET', 'OPTIONS'])
+def get_music_audio(basename):
+    """Raw audio for the effect editor's scrub/preview player. send_from_directory
+    handles Range requests, so seeking works without downloading the whole file."""
+    safe = _safe_basename(basename)
+    audio = _find_audio_file(safe)
+    if audio is None:
+        return jsonify({'error': 'track not found'}), 404
+    return send_from_directory(str(MUSIC_DIR), audio.name, conditional=True)
+
+
+@app.route('/api/effects/meta', methods=['GET', 'OPTIONS'])
+def get_effects_meta():
+    """Everything the editor needs to render lanes and validate segments:
+    device rows, named zones and their pixel ranges, strip length."""
+    return jsonify({
+        'devices': _timeline_devices(),
+        'zones': [
+            {'name': name, 'start': start, 'end': end}
+            for name, (start, end) in STRIP_ZONES.items()
+        ],
+        'pixels': STRIP_PIXELS,
+        'patterns': list(KNOWN_PATTERNS),
+    })
+
+
+@app.route('/api/music/<basename>/timeline', methods=['GET', 'PUT', 'OPTIONS'])
+def music_timeline(basename):
+    safe = _safe_basename(basename)
+    json_path = MUSIC_DIR / f"{safe}.json"
+
+    if request.method == 'GET':
+        if _find_audio_file(safe) is None:
+            return jsonify({'error': 'track not found'}), 404
+        if not json_path.exists():
+            return jsonify({'error': 'no timeline JSON for this track'}), 404
+        try:
+            with open(json_path, 'r') as f:
+                data = json.load(f)
+        except Exception as e:
+            return jsonify({'error': f'failed to read timeline: {e}'}), 500
+        events = data['events'] if isinstance(data, dict) and 'events' in data else data
+        if not isinstance(events, list):
+            return jsonify({'error': 'timeline JSON is malformed'}), 500
+        return jsonify({'basename': safe, 'events': events})
+
+    payload = request.get_json(silent=True)
+    if payload is None:
+        return jsonify({'error': 'expected a JSON body'}), 400
+    if not json_path.exists():
+        # Only ever overwrite a timeline the library already knows about.
+        return jsonify({'error': 'no timeline JSON for this track'}), 404
+    try:
+        timeline = _clean_timeline(payload)
+    except ValueError as e:
+        return jsonify({'error': str(e)}), 400
+    try:
+        _write_timeline(json_path, timeline)
+    except Exception as e:
+        return jsonify({'error': f'failed to write timeline: {e}'}), 500
+
+    print(f"[timeline] saved {json_path.name} ({len(timeline['events'])} events)")
+    with music_state.lock:
+        live = music_state.basename == safe and music_state.process is not None
+    return jsonify({
+        'basename': safe,
+        'events': timeline['events'],
+        # The player loaded its copy at launch; a live song keeps the old one.
+        'restart_required': live,
+    })
+
+
 @app.route('/api/music/<basename>/play', methods=['POST', 'OPTIONS'])
 def play_music(basename):
     safe = _safe_basename(basename)
@@ -866,6 +1111,110 @@ def play_music(basename):
     Thread(target=_music_watchdog, args=(proc, safe), daemon=True).start()
     _music_broadcast()
     return jsonify({'playing': safe, 'linked': link})
+
+
+PREVIEW_READY_TIMEOUT = 30.0
+
+
+def _drain_pipe(proc):
+    """Preview/player subprocesses log every event change. Nobody reads that
+    once we've seen READY, and a full pipe buffer would freeze the render
+    loop -- so keep emptying it."""
+    try:
+        for line in proc.stdout:
+            if line.strip():
+                print(f"[preview] {line.rstrip()}")
+    except Exception:
+        pass
+
+
+@app.route('/api/music/<basename>/preview', methods=['POST', 'OPTIONS'])
+def preview_timeline(basename):
+    """Run a timeline on the real lights with no audio, so the effect editor
+    can sync the room to the song playing in the browser. Accepts unsaved
+    events in the body; they're rendered from a temp file."""
+    safe = _safe_basename(basename)
+    audio = _find_audio_file(safe)
+    if audio is None:
+        return jsonify({'error': 'track not found'}), 404
+
+    payload = request.get_json(silent=True) or {}
+    try:
+        start_ms = max(0.0, float(payload.get('start_ms', 0)))
+    except (TypeError, ValueError):
+        return jsonify({'error': 'start_ms must be a number'}), 400
+
+    if payload.get('events') is not None:
+        try:
+            timeline = _clean_timeline(payload)
+        except ValueError as e:
+            return jsonify({'error': str(e)}), 400
+    else:
+        json_path = MUSIC_DIR / f"{safe}.json"
+        if not json_path.exists():
+            return jsonify({'error': 'no timeline JSON for this track'}), 404
+        with open(json_path, 'r') as f:
+            timeline = json.load(f)
+
+    fd, tmp_name = tempfile.mkstemp(prefix=f"preview-{safe}-", suffix=".json")
+    with os.fdopen(fd, 'w') as f:
+        json.dump(timeline, f)
+
+    cmd = [sys.executable, str(ENGINE_DIR / "led_preview.py"), tmp_name,
+           "--start-ms", str(start_ms), "--song", str(audio)]
+
+    with music_state.lock:
+        _music_kill_locked()
+        try:
+            proc = subprocess.Popen(
+                cmd, cwd=str(ENGINE_DIR),
+                stdout=subprocess.PIPE, stderr=subprocess.STDOUT, text=True,
+            )
+        except Exception as e:
+            Path(tmp_name).unlink(missing_ok=True)
+            return jsonify({'error': f'failed to start preview: {e}'}), 500
+        music_state.process = proc
+        music_state.basename = safe
+        music_state.linked = True
+        music_state.preview = True
+        music_state.preview_path = tmp_name
+
+    # Block until the renderer is warmed up (audio_spectrum timelines load the
+    # waveform first) so the browser starts its audio at the same instant.
+    ready = False
+    deadline = time.time() + PREVIEW_READY_TIMEOUT
+    while time.time() < deadline:
+        line = proc.stdout.readline()
+        if not line:
+            break
+        if line.strip() == 'READY':
+            ready = True
+            break
+        print(f"[preview] {line.rstrip()}")
+
+    if not ready:
+        with music_state.lock:
+            _music_kill_locked()
+        _music_broadcast()
+        return jsonify({'error': 'preview failed to start'}), 500
+
+    Thread(target=_drain_pipe, args=(proc,), daemon=True).start()
+    Thread(target=_music_watchdog, args=(proc, safe), daemon=True).start()
+    _music_broadcast()
+    return jsonify({'preview': safe, 'start_ms': start_ms})
+
+
+@app.route('/api/music/preview/stop', methods=['POST', 'OPTIONS'])
+def stop_preview():
+    """Only stops a preview -- a real track playing in the main UI is left
+    alone, so closing the editor can't cut someone's song off."""
+    with music_state.lock:
+        was_preview = music_state.preview and music_state.process is not None
+        if was_preview:
+            _music_kill_locked()
+    if was_preview:
+        _music_broadcast()
+    return jsonify({'stopped': was_preview})
 
 
 @app.route('/api/music/stop', methods=['POST', 'OPTIONS'])
