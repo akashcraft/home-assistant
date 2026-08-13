@@ -22,19 +22,21 @@ import {
   UploadFileRounded,
 } from '@mui/icons-material'
 import type { MusicTrack } from './MusicTile'
-import { effectEditorUrl } from './config'
-
-const SEGMENTS_MODES = ['all', 'zones', 'mix'] as const
-type SegmentsMode = (typeof SEGMENTS_MODES)[number]
+import {
+  effectEditorUrl,
+  LS_INCLUDE_BULBS,
+  LS_SEGMENTS_MODE,
+  readIncludeBulbs,
+  readSegmentsMode,
+  SEGMENTS_MODES,
+  type SegmentsMode,
+} from './config'
 
 const SEGMENTS_LABELS: Record<SegmentsMode, string> = {
   all: 'All',
   zones: 'Segments Only',
   mix: 'Mix',
 }
-
-const LS_INCLUDE_BULBS = 'library.includeBulbs'
-const LS_SEGMENTS_MODE = 'library.segmentsMode'
 
 type LibraryDrawerProps = {
   open: boolean
@@ -65,16 +67,8 @@ function LibraryDrawer({
   onStop,
   onLibraryChanged,
 }: LibraryDrawerProps) {
-  const [includeBulbs, setIncludeBulbs] = useState<boolean>(() => {
-    const raw = localStorage.getItem(LS_INCLUDE_BULBS)
-    return raw === null ? true : raw === 'true'
-  })
-  const [segmentsMode, setSegmentsMode] = useState<SegmentsMode>(() => {
-    const raw = localStorage.getItem(LS_SEGMENTS_MODE)
-    return (SEGMENTS_MODES as readonly string[]).includes(raw ?? '')
-      ? (raw as SegmentsMode)
-      : 'mix'
-  })
+  const [includeBulbs, setIncludeBulbs] = useState<boolean>(readIncludeBulbs)
+  const [segmentsMode, setSegmentsMode] = useState<SegmentsMode>(readSegmentsMode)
 
   useEffect(() => {
     localStorage.setItem(LS_INCLUDE_BULBS, includeBulbs ? 'true' : 'false')
@@ -100,10 +94,10 @@ function LibraryDrawer({
     setUploading(true)
     setPendingName(file.name)
     try {
+      // Upload only extracts album art now; the timeline is generated later
+      // from the editor, which reads these two options back out of localStorage.
       const form = new FormData()
       form.append('audio', file)
-      form.append('include_bulbs', includeBulbs ? 'true' : 'false')
-      form.append('segments_mode', segmentsMode)
 
       const res = await fetch(`${apiBase}/api/music/upload`, {
         method: 'POST',
@@ -258,6 +252,9 @@ function LibraryDrawer({
                   </Typography>
                 }
               />
+              <Typography variant="caption" sx={{ color: 'text.secondary', px: 1, pt: 0.5 }}>
+                Used when generating a timeline
+              </Typography>
               <Box
                 sx={{
                   display: 'grid',
@@ -389,32 +386,25 @@ function LibraryDrawer({
                         <Typography variant="body2" sx={{ fontWeight: 600 }} noWrap>
                           {track.basename}
                         </Typography>
+                        {!track.has_json && (
+                          <Typography variant="caption" sx={{ color: 'text.secondary' }} noWrap>
+                            No JSON Found
+                          </Typography>
+                        )}
                       </Stack>
 
                       <IconButton
                         size="small"
                         aria-label="Edit effects"
-                        disabled={!track.has_json}
                         title={
                           track.has_json
                             ? 'Edit the Effect Timeline'
-                            : 'No timeline JSON for this track'
+                            : 'Open the editor to generate a timeline'
                         }
                         onClick={() => handleEditEffects(track.basename)}
                         sx={{
-                          color: '#8ab4ff',
-                          backgroundColor: alpha('#8ab4ff', 0.12),
-                          border: '1px solid rgba(138,180,255,0.28)',
-                          borderRadius: '0.85rem',
-                          px: 0.9,
-                          fontSize: '0.78rem',
-                          fontWeight: 700,
-                          ':hover': { backgroundColor: alpha('#8ab4ff', 0.22) },
-                          '&.Mui-disabled': {
-                            color: 'rgba(255,255,255,0.25)',
-                            backgroundColor: alpha('#ffffff', 0.04),
-                            border: '1px solid rgba(255,255,255,0.06)',
-                          },
+                          color: 'text.secondary',
+                          ':hover': { color: '#8ab4ff' },
                         }}
                       >
                         <DataObjectRounded fontSize="small" />

@@ -13,7 +13,7 @@ import {
 } from '@mui/material'
 import { CloseRounded } from '@mui/icons-material'
 import type { Bulb } from './App'
-import { API_BASE_URL } from './config'
+import { API_BASE_URL, STRIP_DEVICE_ID, isStrip } from './config'
 
 type DrawerProps = {
   open: boolean
@@ -37,14 +37,13 @@ export const presetColors = [
   { name: 'White', color: '#ffffff' },
 ]
 
-const MAIN_LIGHT_ID = 1
 // Keep this list in sync with engine/led_patterns.py ZONES + server.py STRIP_ZONES.
 const STRIP_SEGMENTS = ['All', 'Table', 'Bed', 'Kitchen', 'Main', 'Final'] as const
 type StripSegment = (typeof STRIP_SEGMENTS)[number]
 
 async function postStripSegments(segments: StripSegment[], color: string) {
   try {
-    await fetch(`${API_BASE_URL}/api/bulbs/${MAIN_LIGHT_ID}/segments`, {
+    await fetch(`${API_BASE_URL}/api/bulbs/${STRIP_DEVICE_ID}/segments`, {
       method: 'POST',
       headers: { 'Content-Type': 'application/json' },
       body: JSON.stringify({ segments, color, exclusive: true }),
@@ -56,7 +55,7 @@ async function postStripSegments(segments: StripSegment[], color: string) {
 
 async function postMainLightPower(on: boolean) {
   try {
-    await fetch(`${API_BASE_URL}/api/bulbs/${MAIN_LIGHT_ID}/power`, {
+    await fetch(`${API_BASE_URL}/api/bulbs/${STRIP_DEVICE_ID}/power`, {
       method: 'POST',
       headers: { 'Content-Type': 'application/json' },
       body: JSON.stringify({ on }),
@@ -86,7 +85,7 @@ function LightSettingsDrawer({
   onBrightnessChange,
   onColorChange,
 }: DrawerProps) {
-  const isMainLight = bulb?.id === MAIN_LIGHT_ID
+  const isMainLight = isStrip(bulb?.id)
   const [selectedSegments, setSelectedSegments] = useState<StripSegment[]>(() =>
     deriveSelected(stripActive),
   )

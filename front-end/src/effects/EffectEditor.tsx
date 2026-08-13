@@ -15,7 +15,7 @@ import {
 } from '@mui/material'
 import { ThemeProvider, createTheme } from '@mui/material/styles'
 import { RedoRounded, UndoRounded } from '@mui/icons-material'
-import { API_BASE_URL } from '../config'
+import { API_BASE_URL, readIncludeBulbs, readSegmentsMode } from '../config'
 import EffectPalette from './EffectPalette'
 import EffectInspector from './EffectInspector'
 import EffectTimeline, { SNAP_STEP_MS, type EventUpdate } from './EffectTimeline'
@@ -46,8 +46,12 @@ const editorTheme = createTheme({
 })
 
 const LS_SYNC_LIGHTS = 'effects.syncLights'
+const LS_NIGHT_MODE = 'effects.nightMode'
+// Written by the library drawer; generation reuses whatever was picked there.
 /** Shift + arrow key jump; plain arrows nudge by SNAP_STEP_MS. */
 const COARSE_NUDGE_MS = 1000
+/** Minimum gap between playhead state updates during playback (~20fps). */
+const PLAYHEAD_PUSH_MS = 50
 const NEW_EVENT_COLOR: RGB = [138, 180, 255]
 const NEW_EVENT_MS = 2000
 const TAIL_PADDING_MS = 4000
@@ -122,6 +126,41 @@ const toWire = (events: EditorEvent[]): WireEvent[] =>
     })
     .sort((a, b) => a.start_ms - b.start_ms || a.id - b.id)
 
+const NIGHT_RED: RGB = [255, 0, 0]
+const NIGHT_ORANGE: RGB = [180, 55, 0]
+
+const nightColor = (_color: RGB, index: number): RGB => {
+  const base = index % 2 === 0 ? NIGHT_RED : NIGHT_ORANGE
+  return [...base] as RGB
+}
+
+const toNightWire = (events: EditorEvent[]): WireEvent[] =>
+  toWire(events).map((event, index) => {
+    const params = { ...event.params }
+    if (Array.isArray(params.color_b)) {
+      params.color_b = nightColor(toRgb(params.color_b), index + 1)
+    }
+    if (Array.isArray(params.colors)) {
+      params.colors = params.colors.map((color, colorIndex) =>
+        nightColor(toRgb(color), index + colorIndex + 1),
+      )
+    }
+    if (event.pattern === 'rainbow_jump') {
+      params.colors = [
+        nightColor(event.color, index),
+        nightColor(event.color, index + 1),
+      ]
+    }
+    if (event.pattern === 'audio_spectrum') {
+      params.rainbow = false
+    }
+    return {
+      ...event,
+      color: nightColor(event.color, index),
+      params,
+    }
+  })
+
 type EffectEditorProps = { basename: string }
 
 function EffectEditor({ basename }: EffectEditorProps) {
@@ -151,7 +190,11 @@ function EffectEditor({ basename }: EffectEditorProps) {
   const [syncLights, setSyncLights] = useState(
     () => localStorage.getItem(LS_SYNC_LIGHTS) === 'true',
   )
+  const [nightMode, setNightMode] = useState(
+    () => localStorage.getItem(LS_NIGHT_MODE) === 'true',
+  )
   const [syncBusy, setSyncBusy] = useState(false)
+  const [generating, setGenerating] = useState(false)
 
   const audioRef = useRef<HTMLAudioElement | null>(null)
   const skipUnloadGuard = useRef(false)
@@ -201,8 +244,10 @@ function EffectEditor({ basename }: EffectEditorProps) {
     setSelectedUids((current) => (additive ? Array.from(new Set([...current, ...uids])) : uids))
   }, [])
 
-  const wire = useMemo(() => toWire(state.events), [state.events])
-  const dirty = JSON.stringify(wire) !== baseline
+  // Serialize only when the events actually change -- this used to run on
+  // every render, i.e. 60 times a second for the whole timeline during playback.
+  const wireJson = useMemo(() => JSON.stringify(toWire(state.events)), [state.events])
+  const dirty = wireJson !== baseline
 
   const totalMs = useMemo(() => {
     const lastEvent = state.events.reduce((max, event) => Math.max(max, event.end_ms), 0)
@@ -364,6 +409,10 @@ function EffectEditor({ basename }: EffectEditorProps) {
     localStorage.setItem(LS_SYNC_LIGHTS, syncLights ? 'true' : 'false')
   }, [syncLights])
 
+  useEffect(() => {
+    localStorage.setItem(LS_NIGHT_MODE, nightMode ? 'true' : 'false')
+  }, [nightMode])
+
   const stopPreview = useCallback((keepalive = false) => {
     // Best effort: the server also drops the preview if anything else takes
     // the lights, and the renderer exits on its own at the end of the timeline.
@@ -371,6 +420,35 @@ function EffectEditor({ basename }: EffectEditorProps) {
       () => undefined,
     )
   }, [])
+
+  const handleGenerate = useCallback(async () => {
+    setGenerating(true)
+    try {
+      const res = await fetch(`${API_BASE_URL}/api/music/${encoded}/generate`, {
+        method: 'POST',
+        headers: { 'Content-Type': 'application/json' },
+        body: JSON.stringify({
+          include_bulbs: readIncludeBulbs(),
+          segments_mode: readSegmentsMode(),
+        }),
+      })
+      const body = await res.json().catch(() => ({}))
+      if (!res.ok) {
+        setToast({ severity: 'error', message: body.error ?? `Generate failed (${res.status})` })
+        return
+      }
+      // The analysis wrote the file itself, so this lands clean, not dirty.
+      const events = (body.events as unknown[]).map(fromWire)
+      setState({ events, past: [], future: [] })
+      setBaseline(JSON.stringify(toWire(events)))
+      setSelectedUids([])
+      setToast({ severity: 'success', message: `Generated ${events.length} events from the track` })
+    } catch (err) {
+      setToast({ severity: 'error', message: err instanceof Error ? err.message : String(err) })
+    } finally {
+      setGenerating(false)
+    }
+  }, [encoded])
 
   // --- Save / cancel -------------------------------------------------------
   const handleSave = useCallback(async () => {
@@ -437,9 +515,17 @@ function EffectEditor({ basename }: EffectEditorProps) {
   useEffect(() => {
     if (!isPlaying) return
     let frame = 0
+    let lastPush = 0
     const tick = () => {
       const audio = audioRef.current
-      if (audio) setPlayheadMs(audio.currentTime * 1000)
+      const now = performance.now()
+      // Every state push re-renders the editor, so cap it at ~20/s rather
+      // than one per animation frame. The playhead still reads as smooth and
+      // the panels stop doing 60 renders a second on a tablet.
+      if (audio && now - lastPush >= PLAYHEAD_PUSH_MS) {
+        lastPush = now
+        setPlayheadMs(audio.currentTime * 1000)
+      }
       frame = window.requestAnimationFrame(tick)
     }
     frame = window.requestAnimationFrame(tick)
@@ -447,14 +533,17 @@ function EffectEditor({ basename }: EffectEditorProps) {
   }, [isPlaying])
 
   const startPreview = useCallback(
-    async (atMs: number): Promise<boolean> => {
+    async (atMs: number, previewNightMode = nightMode): Promise<boolean> => {
       setSyncBusy(true)
       try {
         const res = await fetch(`${API_BASE_URL}/api/music/${encoded}/preview`, {
           method: 'POST',
           headers: { 'Content-Type': 'application/json' },
           // Send what's on screen, so unsaved edits can be watched on the wall.
-          body: JSON.stringify({ start_ms: Math.round(atMs), events: toWire(state.events) }),
+          body: JSON.stringify({
+            start_ms: Math.round(atMs),
+            events: previewNightMode ? toNightWire(state.events) : toWire(state.events),
+          }),
         })
         if (!res.ok) {
           const body = await res.json().catch(() => ({}))
@@ -469,7 +558,7 @@ function EffectEditor({ basename }: EffectEditorProps) {
         setSyncBusy(false)
       }
     },
-    [encoded, state.events],
+    [encoded, nightMode, state.events],
   )
 
   const seekRestartRef = useRef<number | null>(null)
@@ -520,6 +609,17 @@ function EffectEditor({ basename }: EffectEditorProps) {
       if (!next) stopPreview()
     },
     [startPreview, stopPreview],
+  )
+
+  const handleNightModeChange = useCallback(
+    (next: boolean) => {
+      setNightMode(next)
+      const audio = audioRef.current
+      if (syncLights && audio && !audio.paused) {
+        void startPreview(audio.currentTime * 1000, next)
+      }
+    },
+    [syncLights, startPreview],
   )
 
   // --- Drag from the palette ----------------------------------------------
@@ -793,6 +893,9 @@ function EffectEditor({ basename }: EffectEditorProps) {
               snapMs={snapMs}
               dirty={dirty}
               saving={saving}
+              canGenerate={state.events.length === 0}
+              generating={generating}
+              onGenerate={() => void handleGenerate()}
               playheadMs={playheadMs}
               onChange={(patch) => selected && patchEvent(selected.uid, patch)}
               onDuplicate={() => duplicateEvents(selectedUids)}
@@ -817,8 +920,10 @@ function EffectEditor({ basename }: EffectEditorProps) {
             isPlaying={isPlaying}
             hasAudio={hasAudio}
             syncLights={syncLights}
+            nightMode={nightMode}
             syncBusy={syncBusy}
             onSyncLightsChange={handleSyncLightsChange}
+            onNightModeChange={handleNightModeChange}
             armedPattern={armedPattern}
             onSelect={selectOne}
             onSelectMany={selectMany}

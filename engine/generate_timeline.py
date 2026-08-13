@@ -2,15 +2,11 @@
 Analyzes a song's tempo, beat grid, energy, and harmonic/percussive balance,
 then auto-generates a pattern timeline JSON compatible with led_player.py.
 
-Heuristics (per ~1-bar group of beats, in priority order):
-    1. Drop      -- energy spikes hard above the recent baseline
-                    -> rapid 'beats' flash on every beat in that bar
-    2. Buildup   -- energy trending upward over consecutive bars
-                    -> 'sparkle', density increases the longer the rise continues
-    3. Vocal-ish -- harmonic energy dominates percussive (HPSS ratio)
-                    and it isn't a drop -> calm 'pulse'
-    4. Filler    -- everything else, tiered by energy percentile into
-                    hold / rainbow / comet / alt_band / snake
+The arrangement is built from smoothed phrase energy: intros and breakdowns
+stay sparse, builds add motion, and high-energy phrases repeat a deliberate
+audio-spectrum / motion / colour-jump / beat-punctuation motif. Harmonic and
+percussive balance remains available to the legacy classifier and bulb layer,
+but effect selection is now form-aware rather than random per bar.
 
 This is a heuristic, not true vocal isolation (that needs source separation
 like Demucs/Spleeter). It works reasonably well on typical pop/EDM structure
@@ -20,11 +16,11 @@ strong first draft, not a final mix.
 Usage:
     python generate_timeline.py song.mp3 [output.json] [--group-beats 4] [--zones]
 
-Every event carries an `id` field selecting its target device:
-    id=1 -> the 45-pixel LED strip (Main Light)
-    id=2, 3 -> Kitchen bulbs 1 & 2 (paired, share color)
-    id=4 -> Living Room bulb
-    id=5 -> Hallway bulb
+Every event carries an `id` field selecting its target device. The device
+list comes from bulb_state.json (managed in the UI's Devices drawer):
+    id=1     -> the 45-pixel LED strip (Main Light)
+    id=2, 3  -> first two bulbs, paired so they share a color
+    id=4+    -> any further bulbs, each with its own accent
 Bulb events only carry `color` + `params`; they are single points, not segments.
 led_player restores bulbs to their previous state (bulb_states.json) on exit.
 
@@ -42,6 +38,9 @@ from typing import Dict, List, Optional, Tuple
 
 import librosa
 import numpy as np
+from scipy.signal import find_peaks
+
+import devices
 
 # --- Tunables -----------------------------------------------------------
 
@@ -49,17 +48,18 @@ DEFAULT_GROUP_BEATS = 4      # beats per analysis group (roughly one bar in 4/4)
 BASELINE_LOOKBACK = 4        # how many prior groups define the "recent baseline"
 RISE_THRESHOLD = 1.15        # group must exceed baseline * this to count as "rising"
 DROP_THRESHOLD = 1.55        # group must exceed baseline * this to count as a "drop"
-VOCAL_HARMONIC_RATIO = 0.55  # harmonic energy share above which we call it "vocal-ish"
-INTRO_FADE_SEC = 2.5
-OUTRO_FADE_SEC = 3.0
+VOCAL_HARMONIC_RATIO = 0.48  # broad vocal proxy for vocal-heavy songs
+VOCAL_RAW_RATIO = 0.45       # HPSS is not source separation; favor coverage
+EFFECT_WINDOW_GROUPS = 2      # sustain non-beat gestures for a full phrase
 
 COLOR_PALETTE = [
     [255, 60, 60], [60, 160, 255], [255, 200, 60],
     [120, 255, 120], [200, 80, 255], [255, 120, 180],
 ]
-PASTEL_PALETTE = [
-    [255, 210, 190], [200, 220, 255], [255, 240, 200], [220, 200, 255],
+VOCAL_PALETTE = [
+    [255, 35, 95], [45, 130, 255], [255, 125, 25], [170, 45, 255],
 ]
+PASTEL_PALETTE = VOCAL_PALETTE
 
 ZONES = ["Table", "Bed", "Kitchen", "Main", "Final"]
 
@@ -74,22 +74,24 @@ SPECTRUM_ZONES = ["Table", "Table, Kitchen", "all"]
 BUILDUP_POOL = ["sparkle", "twinkle_fade", "stack", "scramble", "bounce", "comet"]
 VOCAL_POOL = ["pulse", "comet", "criss_cross", "rainbow", "bounce", "twinkle_fade"]
 DROP_ALT_POOL = ["rainbow_jump", "scramble", "stack", "alt_band"]
-FILLER_LOW_POOL = ["hold", "fade", "twinkle_fade", "pulse"]
+FILLER_LOW_POOL = ["fade", "twinkle_fade", "pulse"]
 FILLER_MED_POOL = ["rainbow", "comet", "snake", "criss_cross", "bounce"]
 FILLER_HIGH_POOL = ["alt_band", "snake", "bounce", "scramble", "rainbow_jump", "comet"]
 
 # Every Nth group is replaced with an audio_spectrum showcase.
 SPECTRUM_EVERY_N_GROUPS = 6
 
-STRIP_DEVICE_ID = 1
-BULB_IDS = [2, 3, 4, 5]  # 2/3 = Kitchen pair, 4 = Living Room, 5 = Hallway
+# Both come from bulb_state.json, which the Devices drawer edits -- the bulb
+# count is whatever the user has actually set up, not a fixed 2..5.
+STRIP_DEVICE_ID = devices.STRIP_DEVICE_ID
+BULB_IDS = devices.bulb_ids()
 
 # Patterns that translate cleanly to a single color+brightness bulb.
 BULB_PATTERNS = {
     "drop": ["beats", "pulse", "scramble", "rainbow_jump"],
     "buildup": ["pulse", "fade", "scramble"],
-    "vocal": ["pulse", "hold", "fade"],
-    "filler_low": ["hold", "fade", "pulse"],
+    "vocal": ["pulse", "fade"],
+    "filler_low": ["fade", "pulse"],
     "filler_med": ["pulse", "rainbow_jump", "fade"],
     "filler_high": ["scramble", "rainbow_jump", "pulse"],
 }
@@ -99,9 +101,7 @@ def analyze(song_path: str):
     y, sr = librosa.load(song_path, sr=None, mono=True)
     duration_sec = len(y) / sr
 
-    tempo, beat_frames = librosa.beat.beat_track(y=y, sr=sr)
-    tempo = float(np.asarray(tempo).reshape(-1)[0]) if np.asarray(tempo).size else 120.0
-    beat_times = librosa.frames_to_time(beat_frames, sr=sr)
+    tempo, beat_times = _detect_beats(y, sr)
     if len(beat_times) < 2:
         # Fallback: synthesize a beat grid from a guessed tempo so grouping still works.
         bpm = tempo if tempo else 120.0
@@ -127,6 +127,34 @@ def analyze(song_path: str):
         "harmonic_ratio": harmonic_ratio,
         "harm_times": harm_times,
     }
+
+
+def _detect_beats(y, sr: int):
+    """Detect transient peaks directly, avoiding beat-frame look-ahead.
+
+    librosa's dynamic-programming beat tracker can settle on a musically
+    plausible grid that is visibly early for percussive songs. SciPy peaks on
+    the onset envelope preserve the actual transient timestamps; the tempo is
+    still used only to fill sparse regions.
+    """
+    tempo, beat_frames = librosa.beat.beat_track(y=y, sr=sr)
+    tempo = float(np.asarray(tempo).reshape(-1)[0]) if np.asarray(tempo).size else 120.0
+    onset = librosa.onset.onset_strength(y=y, sr=sr, aggregate=np.median)
+    onset = np.asarray(onset, dtype=float)
+    if not len(onset):
+        return tempo, librosa.frames_to_time(beat_frames, sr=sr)
+    floor = float(np.percentile(onset, 65))
+    distance = max(1, int((60.0 / max(tempo, 1.0)) * sr / 512 * 0.55))
+    peaks, props = find_peaks(
+        onset,
+        distance=distance,
+        prominence=max(0.01, float(np.std(onset) * 0.25)),
+        height=floor,
+    )
+    peak_times = librosa.frames_to_time(peaks, sr=sr)
+    if len(peak_times) >= 4:
+        return tempo, peak_times
+    return tempo, librosa.frames_to_time(beat_frames, sr=sr)
 
 
 def _mean_in_range(values, times, start, end) -> float:
@@ -164,6 +192,14 @@ def build_groups(analysis: dict, group_beats: int) -> List[dict]:
     p33, p66 = np.percentile(all_rms, [33, 66])
     for g in groups:
         g["tier"] = "low" if g["rms"] <= p33 else ("high" if g["rms"] >= p66 else "medium")
+    # A singer can remain present through a loud chorus. Smooth the HPSS
+    # signal independently from energy so brightness does not disappear on
+    # energetic vocal bars.
+    for i, group in enumerate(groups):
+        nearby = groups[max(0, i - 1):min(len(groups), i + 2)]
+        group["vocal_confidence"] = float(np.mean(
+            [item["harmonic_ratio"] for item in nearby]
+        ))
 
     return groups, avg_beat_dur
 
@@ -177,7 +213,7 @@ def classify_groups(groups: List[dict]) -> List[dict]:
 
         is_drop = g["rms"] > baseline * DROP_THRESHOLD
         is_rising = (not is_drop) and g["rms"] > baseline * RISE_THRESHOLD
-        is_vocal = (not is_drop) and (not is_rising) and g["harmonic_ratio"] > VOCAL_HARMONIC_RATIO
+        is_vocal = g.get("vocal_confidence", g["harmonic_ratio"]) >= VOCAL_HARMONIC_RATIO
 
         if is_drop:
             g["label"] = "drop"
@@ -192,6 +228,47 @@ def classify_groups(groups: List[dict]) -> List[dict]:
         else:
             g["label"] = "filler"
             rise_streak = 0
+    return groups
+
+
+def annotate_song_form(groups: List[dict]) -> List[dict]:
+    """Give bars a stable musical role before effects are selected.
+
+    The old generator classified each bar against a short, noisy baseline and
+    then made an independent random choice.  This pass deliberately looks at
+    phrase-sized context, which lets the renderer create recognizable
+    intro/build/chorus/breakdown arcs instead of effect soup.
+    """
+    if not groups:
+        return groups
+
+    energies = np.array([g["rms"] for g in groups], dtype=float)
+    window = max(1, min(4, len(groups) // 8 or 1))
+    smoothed = np.convolve(
+        energies, np.ones(window) / window, mode="same"
+    )
+    if len(groups) > 2:
+        smoothed[0] = float(np.mean(energies[:2]))
+        smoothed[-1] = float(np.mean(energies[-2:]))
+    low, high = np.percentile(smoothed, [30, 70])
+    span = max(high - low, 1e-6)
+    phrase_size = 4
+
+    for i, group in enumerate(groups):
+        level = float((smoothed[i] - low) / span)
+        previous = smoothed[max(0, i - 2):i]
+        trend = float(smoothed[i] - np.mean(previous)) if len(previous) else 0.0
+        group["energy_level"] = max(0.0, min(1.0, level))
+        group["phrase"] = i // phrase_size
+        group["phrase_pos"] = i % phrase_size
+        group["section"] = (
+            "intro" if i < 2 else
+            "outro" if i >= len(groups) - 2 else
+            "build" if trend > span * 0.12 and level < 1.15 else
+            "chorus" if level > 0.9 else
+            "breakdown" if level < 0.2 else
+            "verse"
+        )
     return groups
 
 
@@ -238,8 +315,6 @@ def _build_event(pattern: str, start_ms: int, end_ms: int, segments, color,
         params = {"length": rng.randint(4, 8), "passes": rng.randint(1, 3)}
     elif pattern == "alt_band":
         params = {"band_size": rng.choice([2, 3, 4]), "speed": rng.choice([4, 6, 8, 10])}
-    elif pattern == "hold":
-        params = {}
     elif pattern == "fade":
         params = {"mode": rng.choice(["in_out", "in", "out"])}
     elif pattern == "audio_spectrum":
@@ -320,6 +395,7 @@ def groups_to_events(groups: List[dict], avg_beat_dur: float, segments_mode: str
                 for b in g["beats"]:
                     events.append({
                         "id": STRIP_DEVICE_ID,
+                        "layer": "accent",
                         "pattern": "beats",
                         "start_ms": int(b * 1000),
                         "end_ms": int((b + flash_dur) * 1000),
@@ -364,79 +440,282 @@ def groups_to_events(groups: List[dict], avg_beat_dur: float, segments_mode: str
     return events
 
 
+def groups_to_sophisticated_events(groups: List[dict], avg_beat_dur: float,
+                                   segments_mode: str) -> List[dict]:
+    """Render a coherent arrangement with recurring phrase motifs.
+
+    Effects are chosen from the song form, not independently per bar.  The
+    small amount of repetition is intentional: a chorus should feel like a
+    chorus, while phrase endings get a brighter punctuation effect.
+    """
+    events: List[dict] = []
+    zone_index = 0
+    palettes = [
+        ([255, 70, 90], [255, 190, 60]),
+        ([80, 150, 255], [190, 90, 255]),
+        ([80, 255, 170], [255, 110, 190]),
+    ]
+
+    def segments_for(index: int, force_all: bool = False) -> str:
+        nonlocal zone_index
+        if force_all or segments_mode == "all":
+            return "all"
+        if segments_mode == "mix" and index % 3 == 0:
+            return "all"
+        zone = SPECIAL_ZONES[zone_index % len(SPECIAL_ZONES)]
+        zone_index += 1
+        return zone
+
+    for window_start in range(0, len(groups), EFFECT_WINDOW_GROUPS):
+        window = groups[window_start:window_start + EFFECT_WINDOW_GROUPS]
+        first, last = window[0], window[-1]
+        start_ms = int(first["start"] * 1000)
+        end_ms = int(last["end"] * 1000)
+        group = max(window, key=lambda item: item["rms"])
+        section = group["section"]
+        pos = group["phrase_pos"]
+        primary, secondary = palettes[(window_start // EFFECT_WINDOW_GROUPS) % len(palettes)]
+        color = primary if pos < 2 else secondary
+        pattern = "pulse"
+        params: dict = {}
+        target = segments_for(window_start)
+
+        if section == "intro":
+            pattern = "pulse"
+            params = {"cycles": 1}
+            target = "all"
+            color = [255, 210, 190]
+        elif section == "build":
+            pattern = "stack"
+            params = {"reverse": False}
+            target = segments_for(window_start, True)
+        elif section == "chorus":
+            pattern = ["audio_spectrum", "criss_cross", "rainbow_jump"][
+                (window_start // EFFECT_WINDOW_GROUPS) % 3
+            ]
+            params = (
+                {"sensitivity": 30, "rainbow": True}
+                if pattern == "audio_spectrum" else
+                {"passes": 2, "color_b": list(secondary)}
+                if pattern == "criss_cross" else
+                {"steps": 8}
+            )
+            target = segments_for(window_start, True)
+            for bar in window:
+                for beat in bar["beats"]:
+                    flash_dur = min(0.3, avg_beat_dur * 0.6)
+                    events.append({
+                        "id": STRIP_DEVICE_ID,
+                        "pattern": "beats",
+                        "start_ms": int(beat * 1000),
+                        "end_ms": int((beat + flash_dur) * 1000),
+                        "segments": "all",
+                        "color": list(color),
+                        "params": {"attack_ms": 25},
+                    })
+        elif section == "breakdown":
+            pattern = "pulse"
+            params = {"cycles": max(1, round((end_ms - start_ms) / 8000))}
+            color = [max(35, c // 2) for c in primary]
+        elif section == "outro":
+            pattern = "pulse"
+            params = {"cycles": 1}
+            target = "all"
+            color = [255, 210, 190]
+        else:  # verse
+            pattern = "comet" if (window_start // EFFECT_WINDOW_GROUPS) % 2 else "pulse"
+            if pattern == "pulse":
+                params = {"cycles": max(1, round((end_ms - start_ms) / 8000))}
+            elif pattern == "comet":
+                params = {"length": 6, "passes": 2}
+
+        events.append({
+            "id": STRIP_DEVICE_ID,
+            "layer": "base",
+            "pattern": pattern,
+            "start_ms": start_ms,
+            "end_ms": end_ms,
+            "segments": target,
+            "color": list(color),
+            "params": params,
+        })
+    return events
+
+
+def groups_to_handcrafted_events(groups: List[dict], avg_beat_dur: float,
+                                 segments_mode: str, rng: random.Random) -> List[dict]:
+    """Build the sparse, gesture-based style used by the hand-authored shows.
+
+    Handcrafted timelines do not assign a semantic label to every bar. They
+    alternate short gestures, reuse a small color motif, route occasional
+    gestures to zones, and reserve beat flashes for genuinely energetic
+    moments. This intentionally avoids pretending that HPSS can identify a
+    singer.
+    """
+    events: List[dict] = []
+    palettes = [
+        ([255, 0, 0], [255, 127, 0]),
+        ([75, 0, 130], [0, 0, 255]),
+        ([0, 255, 120], [255, 0, 120]),
+    ]
+    pools = {
+        "low": ["pulse", "twinkle_fade"],
+        "medium": ["sparkle", "pulse", "criss_cross", "comet"],
+        "high": ["criss_cross", "sparkle", "rainbow_jump", "audio_spectrum"],
+    }
+    last_pattern: Optional[str] = None
+    zone_index = 0
+    for window_start in range(0, len(groups), EFFECT_WINDOW_GROUPS):
+        window = groups[window_start:window_start + EFFECT_WINDOW_GROUPS]
+        group = max(window, key=lambda item: item["rms"])
+        primary, secondary = palettes[(window_start // EFFECT_WINDOW_GROUPS) % len(palettes)]
+        tier = group["tier"]
+        pool = [pattern for pattern in pools[tier] if pattern != last_pattern] or pools[tier]
+        pattern = pool[(window_start // EFFECT_WINDOW_GROUPS + (1 if tier == "high" else 0)) % len(pool)]
+        last_pattern = pattern
+        start_ms = int(window[0]["start"] * 1000)
+        end_ms = int(window[-1]["end"] * 1000)
+        color = primary if window_start // EFFECT_WINDOW_GROUPS % 2 == 0 else secondary
+        if segments_mode == "all" or (
+            segments_mode == "mix" and window_start // EFFECT_WINDOW_GROUPS % 3 == 0
+        ):
+            segments = "all"
+        elif window_start // EFFECT_WINDOW_GROUPS % 4 == 0:
+            segments = "Table, Kitchen"
+        else:
+            segments = SPECIAL_ZONES[zone_index % len(SPECIAL_ZONES)]
+            zone_index += 1
+
+        params: dict
+        if pattern == "pulse":
+            params = {"cycles": max(1, round((end_ms - start_ms) / 1000 / 2.0))}
+        elif pattern == "twinkle_fade":
+            params = {"fade_ms": 500, "spawn_chance": 0.06}
+        elif pattern == "sparkle":
+            params = {"density": 0.25}
+        elif pattern == "criss_cross":
+            params = {"passes": 1 if tier == "medium" else 3, "color_b": list(secondary)}
+        elif pattern == "comet":
+            params = {"length": 5, "passes": 2}
+        elif pattern == "rainbow_jump":
+            params = {"steps": 8}
+        elif pattern == "audio_spectrum":
+            params = {"rainbow": True, "sensitivity": 30}
+        else:
+            params = {}
+        events.append({
+            "id": STRIP_DEVICE_ID,
+            "layer": "base",
+            "pattern": pattern,
+            "start_ms": start_ms,
+            "end_ms": end_ms,
+            "segments": segments,
+            "color": list(color),
+            "params": params,
+        })
+
+        # In the hand-authored files, beats punctuate high-energy gestures;
+        # they do not replace the gesture itself.
+        if tier == "high":
+            flash_duration = min(260, max(120, int(avg_beat_dur * 420)))
+            for bar in window:
+                for beat in bar["beats"][::2]:
+                    events.append({
+                        "id": STRIP_DEVICE_ID,
+                        "layer": "accent",
+                        "pattern": "beats",
+                        "start_ms": int(beat * 1000),
+                        "end_ms": int(beat * 1000) + flash_duration,
+                        "segments": "all",
+                        "color": list(secondary),
+                        "params": {"attack_ms": 25},
+                    })
+    return events
+
+
 def _build_bulb_event(bulb_id: int, pattern: str, start_ms: int, end_ms: int,
-                       color, duration_sec: float, rng: random.Random) -> dict:
+                       color, duration_sec: float, rng: random.Random,
+                       params: Optional[dict] = None) -> dict:
     """Bulbs have no segments -- they're single points. Reuse _build_event's
     param picker but strip the 'segments' key and stamp the bulb id."""
     ev = _build_event(pattern, start_ms, end_ms, "all", color, duration_sec, 1, rng)
     ev["id"] = bulb_id
     ev.pop("segments", None)
+    if params is not None:
+        ev["params"] = params
     return ev
 
 
 def groups_to_bulb_events(groups: List[dict], rng: random.Random) -> List[dict]:
-    """One event per group per bulb. Kitchen pair (ids 2 & 3) shares color so
-    the two bulbs feel like one zone; living-room (4) and hallway (5) get
-    independent colors picked from the palette."""
+    """Route bulbs only to isolated vocal phrases and musical impacts."""
     events: List[dict] = []
-    last_by_key: Dict[str, Optional[str]] = {}
+    harmonic_values = np.array([g["harmonic_ratio"] for g in groups], dtype=float)
+    isolated_vocal_floor = max(
+        VOCAL_RAW_RATIO,
+        float(np.percentile(harmonic_values, 75)) if len(harmonic_values) else VOCAL_RAW_RATIO,
+    )
+    vocal_color_index = 0
+    impact_index = 0
 
-    def pick_bulb_pattern(label: str, tier: Optional[str]) -> str:
-        if label == "filler":
-            key = f"filler_{tier or 'med'}"
+    for index, group in enumerate(groups):
+        start_ms = int(group["start"] * 1000)
+        end_ms = int(group["end"] * 1000)
+        duration_sec = max(0.1, (end_ms - start_ms) / 1000)
+
+        # A vocal bulb event requires a strong local harmonic peak and a
+        # vocal classification. Neighboring harmonic material alone is not
+        # enough, which prevents instrument-heavy passages from lighting bulbs.
+        isolated_vocal = (
+            group.get("label") == "vocal"
+            and group["harmonic_ratio"] >= isolated_vocal_floor
+        )
+        is_drop = group.get("label") == "drop"
+        is_upbeat = group["tier"] == "high" and group.get("label") != "buildup"
+
+        if isolated_vocal:
+            color = VOCAL_PALETTE[vocal_color_index % len(VOCAL_PALETTE)]
+            vocal_color_index += 1
+            pattern = "pulse"
+            params = {"cycles": max(1, round(duration_sec / 2.0))}
+        elif is_drop or is_upbeat:
+            color = ([255, 40, 20], [255, 140, 20], [170, 40, 255])[
+                impact_index % 3
+            ]
+            impact_index += 1
+            pattern = "rainbow_jump" if is_drop else "audio_spectrum"
+            params = {"steps": 8} if pattern == "rainbow_jump" else {
+                "rainbow": False,
+                "sensitivity": 35,
+            }
         else:
-            key = label
-        pool = BULB_PATTERNS.get(key, BULB_PATTERNS["vocal"])
-        last = last_by_key.get(key)
-        pat = _pick_no_repeat(pool, last, rng)
-        last_by_key[key] = pat
-        return pat
+            continue
 
-    for i, g in enumerate(groups):
-        start_ms = int(g["start"] * 1000)
-        end_ms = int(g["end"] * 1000)
-        dur_sec = g["end"] - g["start"]
-        label = g["label"]
-        tier = g.get("tier")
-
-        # Kitchen pair -- same color, same pattern so both bulbs pulse together.
-        kitchen_color = COLOR_PALETTE[i % len(COLOR_PALETTE)]
-        kitchen_pattern = pick_bulb_pattern(label, tier)
-        for bid in (2, 3):
+        for bid in BULB_IDS:
             events.append(_build_bulb_event(
-                bid, kitchen_pattern, start_ms, end_ms,
-                kitchen_color, dur_sec, rng))
-
-        # Living room + hallway -- each their own accent, softer palette for vocals.
-        for bid in (4, 5):
-            if label == "vocal":
-                c = PASTEL_PALETTE[(i + bid) % len(PASTEL_PALETTE)]
-            else:
-                c = COLOR_PALETTE[(i + bid * 2) % len(COLOR_PALETTE)]
-            pat = pick_bulb_pattern(label, tier)
-            events.append(_build_bulb_event(
-                bid, pat, start_ms, end_ms, c, dur_sec, rng))
+                bid, pattern, start_ms, end_ms, color, duration_sec, rng, params))
 
     return events
 
 
 def add_intro_outro(events: List[dict], duration_sec: float) -> List[dict]:
-    intro_end_ms = int(INTRO_FADE_SEC * 1000)
-    outro_start_ms = int((duration_sec - OUTRO_FADE_SEC) * 1000)
+    """Keep generated effects running to the exact song boundaries.
 
-    events = [e for e in events if e["start_ms"] >= intro_end_ms and e["end_ms"] <= outro_start_ms]
-
-    intro = {
-        "id": STRIP_DEVICE_ID,
-        "pattern": "fade", "start_ms": 0, "end_ms": intro_end_ms,
-        "segments": "all", "color": [255, 255, 255], "params": {"mode": "in"},
-    }
-    outro = {
-        "id": STRIP_DEVICE_ID,
-        "pattern": "fade", "start_ms": outro_start_ms, "end_ms": int(duration_sec * 1000),
-        "segments": "all", "color": [255, 255, 255], "params": {"mode": "out"},
-    }
-    return [intro] + events + [outro]
+    The first and last real effects are extended instead of inserting
+    arbitrary fade events, which keeps the arrangement faithful to the track.
+    """
+    result = list(events)
+    base = [
+        event for event in result
+        if event.get("id", STRIP_DEVICE_ID) == STRIP_DEVICE_ID
+        and event.get("layer", "base") != "accent"
+    ]
+    if not base:
+        return result
+    first = min(base, key=lambda event: event["start_ms"])
+    last = max(base, key=lambda event: event["end_ms"])
+    first["start_ms"] = 0
+    last["end_ms"] = int(duration_sec * 1000)
+    return result
 
 
 def generate(song_path: str, group_beats: int = DEFAULT_GROUP_BEATS,
@@ -448,7 +727,8 @@ def generate(song_path: str, group_beats: int = DEFAULT_GROUP_BEATS,
     analysis = analyze(song_path)
     groups, avg_beat_dur = build_groups(analysis, group_beats)
     groups = classify_groups(groups)
-    events = groups_to_events(groups, avg_beat_dur, segments_mode, rng)
+    groups = annotate_song_form(groups)
+    events = groups_to_handcrafted_events(groups, avg_beat_dur, segments_mode, rng)
     events = add_intro_outro(events, analysis["duration_sec"])
     if include_bulbs:
         bulb_events = groups_to_bulb_events(groups, rng)

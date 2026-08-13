@@ -2,6 +2,7 @@ import { alpha, Box, Card, Chip, Stack, Typography } from '@mui/material'
 import { LightbulbRounded, LightbulbOutlineRounded, LightRounded, SettingsRounded } from '@mui/icons-material'
 import type { Bulb } from './App'
 import { presetColors } from './Drawer'
+import { isStrip } from './config'
 
 type TileProps = {
   bulb?: Bulb
@@ -54,7 +55,7 @@ function Tile({ bulb, onToggle, onOpenSettings, isPhone }: TileProps) {
         }}
       >
         <Box sx={{ display: 'flex', alignItems: 'flex-start', justifyContent: 'space-between', gap: 2 }}>
-          {bulb.id === 1 ?
+          {isStrip(bulb.id) ?
             <LightRounded
               sx={{
                 fontSize: 33,

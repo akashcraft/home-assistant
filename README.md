@@ -7,10 +7,11 @@ Web-based control hub for an all local smart lighting, no internet needed. A 45-
 - Dark Mode and Phone-friendly
 - One-tap Routines (Kitchen, Red, Orange, Maximum, Sleep)
 - Per-bulb Power, Colour, and Brightness with live socket updates
+- Devices drawer to add, rename, re-address or remove lights by IP, with no restart
 - LED strip per-segment control
-- Music library with album art extraction and auto-generated LED timelines from `librosa` beat analysis
+- Music library with album art extraction, plus on-demand LED timelines from onset-peak analysis; generated shows borrow the handcrafted timelines' sparse gestures, recurring color motifs, selective zone routing, layered beat accents, isolated-vocal pulses, and upbeat/drop bulb accents
 - Optional "Enable Light Show" playback mode that drives the whole room in time with the track
-- Visual effect editor: a drag-and-drop timeline for hand-tuning a track's generated JSON
+- Visual effect editor: a drag-and-drop timeline for generating and hand-tuning a track's JSON
 - Bulb offline detection with automatic UI lockout, only pinging while a client is connected
 - Persistent library preferences via `localStorage`
 
@@ -46,8 +47,8 @@ All devices need LAN control enabled in the Govee Home app.
 sudo apt update && sudo apt-get install git python3-venv ffmpeg libsndfile1
 ```
 
-### Backend
-Python 3.11+ recommended. Create a virtual environment and install the requirements:
+### Setup
+Python 3.11+ recommended, plus Node.js for the frontend build. Create a virtual environment and install the requirements:
 ```
 git clone https://github.com/akashcraft/home-assistant.git
 cd home-assistant
@@ -55,25 +56,51 @@ python3 -m venv .venv
 source .venv/bin/activate
 pip install -r requirements.txt
 ```
-Run the server:
-```
-python server.py
-```
-It listens on `0.0.0.0:8080` (HTTP + Socket.IO).
+`.venv` is one of the interpreters `start.sh` looks for, so once this is done there's nothing to activate by hand.
 
-### Frontend
+### Running it
+```
+./start.sh
+```
+That's the whole thing. It builds the frontend if it's out of date, then serves the UI **and** the API from one python process on port 8080 - no second terminal, no vite. Open `http://localhost:8080`, or `http://<server-ip>:8080` from a phone or tablet.
+
+#### From Finder
+Double-click **Home Lights.command**. It runs the same launcher in a Terminal window, then opens the UI in your browser once the server answers. The window stays up so you can watch the log; Ctrl+C (or closing it) stops the server.
+
+#### On the Orange Pi (start at boot)
+`deploy/home-lights.service` is a systemd unit, so the Pi serves the UI from boot without anyone logging in:
+```
+sudo cp deploy/home-lights.service /etc/systemd/system/
+sudo systemctl daemon-reload
+sudo systemctl enable --now home-lights
+```
+Edit `User` and the paths in the file first. It runs with `--no-build` on the assumption you build on your laptop and copy `front-end/dist` across - the Pi can do it, just slowly.
+
+| | |
+|---|---|
+| `./start.sh` | build if stale, then run |
+| `./start.sh --rebuild` | force a fresh frontend build |
+| `./start.sh --no-build` | skip the build (fastest start) |
+| `PORT=9000 ./start.sh` | serve on a different port |
+
+The launcher picks the first python that has the dependencies: `$PYTHON`, then `.venv/`, then a `homeassistant-led` conda env, then `python3`. The music engine runs as subprocesses of that same interpreter, so it's the one that needs `librosa` and `pygame`.
+
+Because the built UI is served by Flask, it talks to whichever host served it - there's no address baked into the bundle and nothing to edit when the server's IP changes.
+
+### Frontend development
 ```
 cd front-end
 npm ci
 npm run dev
 ```
-For a production deploy, `npm run build` and serve the `dist/` folder from any static host - or point `send_from_directory` in `server.py` at it and serve from one process.
+Vite's dev server has hot reload, but runs on its own port, so it needs to know where the API lives. Set that in `DEV_API_BASE_URL` in `front-end/src/config.ts`, or per run with `VITE_API_BASE_URL=http://192.168.2.27:8080 npm run dev`. Production builds ignore both.
 
-> [!IMPORTANT]
-> Update `API_BASE_URL` in `front-end/src/config.ts` to your server's IP. It can also be overridden per run with the `VITE_API_BASE_URL` environment variable.
+## Managing Devices
+The slider icon beside the clock opens the **Devices** drawer - add a bulb by IP, rename or re-address an existing one, or remove it. Changes are written to `bulb_state.json` immediately and pushed to every connected client; no restart needed.
 
-## Changing Bulb Defaults
-Bulb state lives in `bulb_state.json` at the project root. First launch creates it from the defaults baked into `server.py`. Edit the file (or the `DEFAULT_BULBS` dict in `server.py`) to change the IP list, names, or starting colours. Restart `server.py` to reload.
+Device id 1 is always the LED strip. It carries the per-segment razer logic the bulbs don't have, so its address is editable but it can't be deleted. Every other id is an ordinary colour bulb, and you can have as many (or as few) as you like.
+
+`bulb_state.json` is the single source of truth for the whole project - the server, the music engine and the effect editor all read it, so no IP or device id is hardcoded anywhere. The `DEFAULT_BULBS` dict in `server.py` only seeds the file on first launch. Editing the file by hand still works if you'd rather; restart `server.py` to reload.
 
 Example entry:
 ```json
@@ -86,6 +113,8 @@ Example entry:
   "color": "#ff680a"
 }
 ```
+
+New bulbs need LAN control enabled in the Govee Home app, and are best given a reserved address in your router so they don't move.
 
 The 45-pixel strip zones are defined in `server.py` (`STRIP_ZONES`) and mirrored in `engine/led_patterns.py`. Both must stay in sync if you change pixel ranges. The code is reverse engineered thanks to https://github.com/nicolasdeory/govee-realtime-control
 

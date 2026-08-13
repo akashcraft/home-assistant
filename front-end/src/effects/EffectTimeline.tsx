@@ -1,4 +1,4 @@
-import { useEffect, useMemo, useRef } from 'react'
+import { useCallback, useEffect, useMemo, useRef } from 'react'
 import {
   alpha,
   Box,
@@ -80,8 +80,10 @@ type EffectTimelineProps = {
   isPlaying: boolean
   hasAudio: boolean
   syncLights: boolean
+  nightMode: boolean
   syncBusy: boolean
   onSyncLightsChange: (next: boolean) => void
+  onNightModeChange: (next: boolean) => void
   snapEnabled: boolean
   onSnapChange: (next: boolean) => void
   armedPattern: string | null
@@ -106,8 +108,10 @@ function EffectTimeline({
   isPlaying,
   hasAudio,
   syncLights,
+  nightMode,
   syncBusy,
   onSyncLightsChange,
+  onNightModeChange,
   snapEnabled,
   onSnapChange,
   armedPattern,
@@ -177,9 +181,14 @@ function EffectTimeline({
     }
   }, [playheadMs, pxPerMs, isPlaying])
 
-  const snap = (ms: number) => (snapMs ? Math.round(ms / snapMs) * snapMs : Math.round(ms))
+  const snap = useCallback(
+    (ms: number) => (snapMs ? Math.round(ms / snapMs) * snapMs : Math.round(ms)),
+    [snapMs],
+  )
 
-  const handleEventPointerDown = (event: EditorEvent, e: React.PointerEvent<HTMLDivElement>) => {
+  // These are useCallback'd so the memoized lane list below keeps a stable
+  // identity while the playhead ticks.
+  const handleEventPointerDown = useCallback((event: EditorEvent, e: React.PointerEvent<HTMLDivElement>) => {
     if (e.pointerType === 'mouse' && e.button !== 0) return
     // Alt-drag rubber-bands even when starting on top of an event -- a busy
     // lane can be wall-to-wall with no empty space to start from.
@@ -222,10 +231,14 @@ function EffectTimeline({
           deviceIndex: Math.max(0, devices.findIndex((d) => d.id === candidate.id)),
         })),
     }
-    e.currentTarget.setPointerCapture(e.pointerId)
-  }
+    try {
+      e.currentTarget.setPointerCapture(e.pointerId)
+    } catch {
+      // Pointer already gone; the drag still tracks via normal events.
+    }
+  }, [devices, events, selectedSet, onSelect])
 
-  const handleEventPointerMove = (e: React.PointerEvent<HTMLDivElement>) => {
+  const handleEventPointerMove = useCallback((e: React.PointerEvent<HTMLDivElement>) => {
     const drag = dragRef.current
     if (!drag) return
     const dx = e.clientX - drag.pointerX
@@ -270,7 +283,7 @@ function EffectTimeline({
 
     const end = Math.max(snap(drag.origEnd + deltaMs), drag.origStart + MIN_EVENT_MS)
     onEventsMutate([{ uid: drag.uid, patch: { end_ms: end } }], recordHistory)
-  }
+  }, [devices, pxPerMs, snap, onEventsMutate])
 
   /** The hover head is written straight to the DOM: it follows every mouse
    *  move, and re-rendering a few hundred event blocks that often would
@@ -296,12 +309,12 @@ function EffectTimeline({
     if (ghostRef.current) ghostRef.current.style.opacity = '0'
   }
 
-  const endDrag = (e: React.PointerEvent<HTMLDivElement>) => {
+  const endDrag = useCallback((e: React.PointerEvent<HTMLDivElement>) => {
     if (dragRef.current && e.currentTarget.hasPointerCapture(e.pointerId)) {
       e.currentTarget.releasePointerCapture(e.pointerId)
     }
     dragRef.current = null
-  }
+  }, [])
 
   // --- Marquee selection ---------------------------------------------------
   // A press on empty lane space is ambiguous until the pointer moves: a drag
@@ -309,7 +322,7 @@ function EffectTimeline({
   // pointerup, and the rectangle is drawn straight to the DOM to keep every
   // event block out of the re-render path while dragging.
 
-  const marqueeBox = (e: React.PointerEvent<HTMLDivElement>) => {
+  const marqueeBox = useCallback((e: React.PointerEvent<HTMLDivElement>) => {
     const state = marqueeStateRef.current
     const lanes = lanesRef.current
     if (!state || !lanes) return null
@@ -322,9 +335,9 @@ function EffectTimeline({
       top: Math.min(state.startY, y),
       bottom: Math.max(state.startY, y),
     }
-  }
+  }, [])
 
-  const handleLanesPointerDown = (e: React.PointerEvent<HTMLDivElement>) => {
+  const handleLanesPointerDown = useCallback((e: React.PointerEvent<HTMLDivElement>) => {
     // Event blocks stop propagation, so anything arriving here is empty space.
     if (e.pointerType === 'mouse' && e.button !== 0) return
     const lanes = lanesRef.current
@@ -346,9 +359,9 @@ function EffectTimeline({
     } catch {
       // Pointer already released; plain bubbling still drives the marquee.
     }
-  }
+  }, [])
 
-  const handleLanesPointerMove = (e: React.PointerEvent<HTMLDivElement>) => {
+  const handleLanesPointerMove = useCallback((e: React.PointerEvent<HTMLDivElement>) => {
     const state = marqueeStateRef.current
     const box = marqueeBox(e)
     const el = marqueeRef.current
@@ -360,9 +373,9 @@ function EffectTimeline({
     el.style.top = `${box.top}px`
     el.style.width = `${box.right - box.left}px`
     el.style.height = `${box.bottom - box.top}px`
-  }
+  }, [marqueeBox])
 
-  const handleLanesPointerUp = (e: React.PointerEvent<HTMLDivElement>) => {
+  const handleLanesPointerUp = useCallback((e: React.PointerEvent<HTMLDivElement>) => {
     const state = marqueeStateRef.current
     const box = marqueeBox(e)
     if (marqueeRef.current) marqueeRef.current.style.display = 'none'
@@ -392,7 +405,102 @@ function EffectTimeline({
       .filter((event) => laneIds.has(event.id) && event.start_ms < toMs && event.end_ms > fromMs)
       .map((event) => event.uid)
     onSelectMany(hits, state.additive)
-  }
+  }, [devices, events, pxPerMs, marqueeBox, onLaneClick, onSelectMany])
+
+  // Memoized so a playhead tick -- 60 a second while the song plays --
+  // doesn't rebuild every event block. Nothing in here depends on the
+  // playhead, so the deps deliberately leave it out.
+  const laneRows = useMemo(
+    () =>
+      devices.map((device) => {
+                    const laneEvents = eventsByDevice.get(device.id) ?? []
+                    return (
+                      <Box
+                        key={device.id}
+                        data-lane-id={device.id}
+                        style={{
+                          cursor: armedPattern ? 'copy' : 'default',
+                          background:
+                            snapMs && snapMs * pxPerMs > 6
+                              ? `repeating-linear-gradient(to right, rgba(255,255,255,0.05) 0 1px, transparent 1px ${snapMs * pxPerMs}px)`
+                              : 'transparent',
+                        }}
+                        sx={{
+                          position: 'relative',
+                          height: LANE_HEIGHT,
+                          borderBottom: '1px solid rgba(255,255,255,0.05)',
+                        }}
+                      >
+                        {laneEvents.map((event) => {
+                          const left = event.start_ms * pxPerMs
+                          const width = Math.max(3, (event.end_ms - event.start_ms) * pxPerMs)
+                          const selected = selectedSet.has(event.uid)
+                          const base = rgbCss(event.color)
+                          const showLabel = width > 46
+                          return (
+                            <Box
+                              key={event.uid}
+                              onPointerDown={(e) => handleEventPointerDown(event, e)}
+                              onPointerMove={handleEventPointerMove}
+                              onPointerUp={endDrag}
+                              onPointerCancel={endDrag}
+                              title={`${patternLabel(event.pattern)} · ${formatClock(event.start_ms, true)} → ${formatClock(
+                                event.end_ms,
+                                true,
+                              )}${device.kind === 'strip' ? ` · ${event.segments}` : ''}`}
+                              // Geometry and colour live in `style`, not `sx`: MUI
+                              // hashes every distinct sx object into a CSS rule it
+                              // never evicts, so dragging or scrubbing would leak
+                              // one rule per pixel of movement.
+                              style={{
+                                left,
+                                width,
+                                background: `linear-gradient(180deg, ${alpha(base, 0.95)}, ${alpha(base, 0.6)})`,
+                                border: selected
+                                  ? '2px solid #ffffff'
+                                  : overlapping.has(event.uid)
+                                    ? '1px solid rgba(255,120,120,0.9)'
+                                    : '1px solid rgba(0,0,0,0.35)',
+                                boxShadow: selected ? '0 0 0 1px rgba(0,0,0,0.6), 0 6px 18px rgba(0,0,0,0.45)' : 'none',
+                                zIndex: selected ? 2 : 1,
+                              }}
+                              sx={{
+                                position: 'absolute',
+                                top: 6,
+                                height: LANE_HEIGHT - 14,
+                                borderRadius: 1,
+                                px: 0.75,
+                                display: 'flex',
+                                alignItems: 'center',
+                                overflow: 'hidden',
+                                touchAction: 'none',
+                                userSelect: 'none',
+                                cursor: 'grab',
+                              }}
+                            >
+                              {showLabel && (
+                                <Typography
+                                  variant="caption"
+                                  noWrap
+                                  sx={{
+                                    fontWeight: 700,
+                                    pointerEvents: 'none',
+                                    color: isLight(event.color) ? 'rgba(0,0,0,0.82)' : '#ffffff',
+                                    textShadow: isLight(event.color) ? 'none' : '0 1px 2px rgba(0,0,0,0.5)',
+                                  }}
+                                >
+                                  {patternLabel(event.pattern)}
+                                </Typography>
+                              )}
+                            </Box>
+                          )
+                        })}
+                      </Box>
+                    )
+                  }),
+    [devices, eventsByDevice, selectedSet, overlapping, pxPerMs, snapMs, armedPattern,
+     handleEventPointerDown, handleEventPointerMove, endDrag],
+  )
 
   return (
     <Stack sx={{ height: '100%', minHeight: 0 }}>
@@ -417,6 +525,23 @@ function EffectTimeline({
         </Stack>
 
         <Stack direction="row" sx={{ alignItems: 'center', gap: 0.5 }}>
+          <Tooltip title="Use only red and orange during light preview; saved JSON is unchanged">
+            <FormControlLabel
+              sx={{ mr: 0.5 }}
+              control={
+                <Switch
+                  size="small"
+                  checked={nightMode}
+                  onChange={(e) => onNightModeChange(e.target.checked)}
+                />
+              }
+              label={
+                <Typography variant="body2" sx={{ fontWeight: 500 }}>
+                  Night Mode
+                </Typography>
+              }
+            />
+          </Tooltip>
           <Tooltip title="Run the timeline on the real lights while the song plays here">
             <FormControlLabel
               sx={{ mr: 0.5 }}
@@ -520,7 +645,8 @@ function EffectTimeline({
             ref={surfaceRef}
             onPointerMove={moveGhost}
             onPointerLeave={hideGhost}
-            sx={{ position: 'relative', width: totalPx }}
+            style={{ width: totalPx }}
+            sx={{ position: 'relative' }}
           >
             <Box
               onPointerDown={(e) => {
@@ -538,9 +664,9 @@ function EffectTimeline({
               {ticks.values.map((ms) => (
                 <Box
                   key={ms}
+                  style={{ left: ms * pxPerMs }}
                   sx={{
                     position: 'absolute',
-                    left: ms * pxPerMs,
                     top: 0,
                     bottom: 0,
                     borderLeft: '1px solid rgba(255,255,255,0.10)',
@@ -565,84 +691,7 @@ function EffectTimeline({
               onPointerCancel={handleLanesPointerUp}
               sx={{ position: 'relative', touchAction: 'pan-x pan-y' }}
             >
-              {devices.map((device) => {
-                const laneEvents = eventsByDevice.get(device.id) ?? []
-                return (
-                  <Box
-                    key={device.id}
-                    data-lane-id={device.id}
-                    sx={{
-                      position: 'relative',
-                      height: LANE_HEIGHT,
-                      borderBottom: '1px solid rgba(255,255,255,0.05)',
-                      cursor: armedPattern ? 'copy' : 'default',
-                      background:
-                        snapMs && snapMs * pxPerMs > 6
-                          ? `repeating-linear-gradient(to right, rgba(255,255,255,0.05) 0 1px, transparent 1px ${snapMs * pxPerMs}px)`
-                          : 'transparent',
-                    }}
-                  >
-                    {laneEvents.map((event) => {
-                      const left = event.start_ms * pxPerMs
-                      const width = Math.max(3, (event.end_ms - event.start_ms) * pxPerMs)
-                      const selected = selectedSet.has(event.uid)
-                      const base = rgbCss(event.color)
-                      const showLabel = width > 46
-                      return (
-                        <Box
-                          key={event.uid}
-                          onPointerDown={(e) => handleEventPointerDown(event, e)}
-                          onPointerMove={handleEventPointerMove}
-                          onPointerUp={endDrag}
-                          onPointerCancel={endDrag}
-                          title={`${patternLabel(event.pattern)} · ${formatClock(event.start_ms, true)} → ${formatClock(
-                            event.end_ms,
-                            true,
-                          )}${device.kind === 'strip' ? ` · ${event.segments}` : ''}`}
-                          sx={{
-                            position: 'absolute',
-                            left,
-                            width,
-                            top: 6,
-                            height: LANE_HEIGHT - 14,
-                            borderRadius: 1,
-                            px: 0.75,
-                            display: 'flex',
-                            alignItems: 'center',
-                            overflow: 'hidden',
-                            touchAction: 'none',
-                            userSelect: 'none',
-                            cursor: 'grab',
-                            background: `linear-gradient(180deg, ${alpha(base, 0.95)}, ${alpha(base, 0.6)})`,
-                            border: selected
-                              ? '2px solid #ffffff'
-                              : overlapping.has(event.uid)
-                                ? '1px solid rgba(255,120,120,0.9)'
-                                : '1px solid rgba(0,0,0,0.35)',
-                            boxShadow: selected ? '0 0 0 1px rgba(0,0,0,0.6), 0 6px 18px rgba(0,0,0,0.45)' : 'none',
-                            zIndex: selected ? 2 : 1,
-                          }}
-                        >
-                          {showLabel && (
-                            <Typography
-                              variant="caption"
-                              noWrap
-                              sx={{
-                                fontWeight: 700,
-                                pointerEvents: 'none',
-                                color: isLight(event.color) ? 'rgba(0,0,0,0.82)' : '#ffffff',
-                                textShadow: isLight(event.color) ? 'none' : '0 1px 2px rgba(0,0,0,0.5)',
-                              }}
-                            >
-                              {patternLabel(event.pattern)}
-                            </Typography>
-                          )}
-                        </Box>
-                      )
-                    })}
-                  </Box>
-                )
-              })}
+              {laneRows}
 
               <Box
                 ref={marqueeRef}
@@ -692,16 +741,20 @@ function EffectTimeline({
               />
             </Box>
 
+            {/* Transform, not `left`, and via `style` so a moving playhead
+                doesn't mint a fresh emotion rule on every animation frame. */}
             <Box
+              style={{ transform: `translateX(${playheadMs * pxPerMs}px)` }}
               sx={{
                 position: 'absolute',
-                left: playheadMs * pxPerMs,
+                left: 0,
                 top: 0,
                 bottom: 0,
                 width: 2,
                 marginLeft: '-1px',
                 background: '#ff5f5f',
                 pointerEvents: 'none',
+                willChange: 'transform',
                 zIndex: 3,
               }}
             />

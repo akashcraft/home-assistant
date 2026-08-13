@@ -1,10 +1,10 @@
 """
-Talks to the Govee LAN bulbs (ids 2..5 in ../bulb_state.json) during song
+Talks to the Govee LAN bulbs listed in ../bulb_state.json during song
 playback and restores them to their previous state when playback ends.
 
-The strip at 192.168.2.30 (id 1) is driven directly by led_player.py -- this
-module is only for the color+brightness-only bulbs. Kitchen has two bulbs
-(ids 2 and 3); living room and hallway are ids 4 and 5.
+The strip (device id 1) is driven directly by led_player.py -- this module is
+only for the color+brightness-only bulbs. Which bulbs exist, and at what
+addresses, is whatever the UI's Devices drawer has configured.
 
 Bulb network calls are slow (~50-200ms per command over LAN), so send() is
 throttled per-bulb and only fires when the target color or brightness has
@@ -37,6 +37,7 @@ except ImportError:
     GOVEE_AVAILABLE = False
 
 SERVER_STATE_FILE = PROJECT_ROOT / "bulb_state.json"
+STRIP_DEVICE_ID = 1
 SNAPSHOT_FILE = Path(__file__).with_name("bulb_states.json")
 
 # Per-bulb min interval between hardware commands (seconds). Govee LAN gets
@@ -147,7 +148,7 @@ class BulbController:
                 bid = int(bid_str)
             except (TypeError, ValueError):
                 continue
-            if bid == 1:  # strip handled by led_player itself
+            if bid == STRIP_DEVICE_ID:  # strip handled by led_player itself
                 continue
             ip = saved.get("ip")
             if not ip:

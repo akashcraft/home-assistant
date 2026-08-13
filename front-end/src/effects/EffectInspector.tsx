@@ -4,6 +4,7 @@ import {
   Box,
   Button,
   Chip,
+  CircularProgress,
   Divider,
   IconButton,
   MenuItem,
@@ -19,6 +20,7 @@ import {
 } from '@mui/material'
 import {
   AddRounded,
+  AutoFixHighRounded,
   CloseRounded,
   ContentCopyRounded,
   DeleteOutlineRounded,
@@ -68,6 +70,10 @@ type EffectInspectorProps = {
   snapMs: number | null
   dirty: boolean
   saving: boolean
+  /** Offered only while the track has no timeline of its own. */
+  canGenerate: boolean
+  generating: boolean
+  onGenerate: () => void
   playheadMs: number
   onChange: (patch: Partial<EditorEvent>) => void
   onDuplicate: () => void
@@ -497,6 +503,9 @@ function EffectInspector({
   snapMs,
   dirty,
   saving,
+  canGenerate,
+  generating,
+  onGenerate,
   playheadMs,
   onChange,
   onDuplicate,
@@ -538,6 +547,25 @@ function EffectInspector({
           )}
         </Stack>
         <Stack direction="row" spacing={1}>
+          {canGenerate && (
+            <Button
+              size="small"
+              variant="outlined"
+              startIcon={generating ? <CircularProgress size={14} thickness={6} /> : <AutoFixHighRounded />}
+              onClick={onGenerate}
+              disabled={generating}
+              sx={{
+                textTransform: 'none',
+                borderRadius: 2,
+                fontWeight: 600,
+                borderColor: 'rgba(138,180,255,0.5)',
+                color: '#8ab4ff',
+                ':hover': { borderColor: '#8ab4ff' },
+              }}
+            >
+              {generating ? 'Generating…' : 'Generate'}
+            </Button>
+          )}
           <Button
             size="small"
             variant="outlined"

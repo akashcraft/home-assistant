@@ -42,11 +42,48 @@ socketio = SocketIO(app, cors_allowed_origins='*', async_mode='threading')
 STATE_FILE = Path(__file__).with_name('bulb_state.json')
 STATE_LOCK = Lock()
 
+# Device id 1 is always the LED strip: it speaks the razer segment protocol
+# and has per-zone logic no bulb has, so it can be re-addressed but never
+# deleted. Every other id is an ordinary colour bulb, freely added/removed
+# from the Devices drawer. bulb_state.json is the single source of truth --
+# nothing in the server, engine or UI should hardcode an IP or an id list.
+STRIP_DEVICE_ID = 1
+
 DEFAULT_BULBS = {
     "1": {"id": 1, "name": "Main Light", "ip": "192.168.2.30", "on": False, "brightness": 100, "color": "#ff0000"},
     "2": {"id": 2, "name": "Bulb 1", "ip": "192.168.2.25", "on": False, "brightness": 100, "color": "#ff0000"},
     "3": {"id": 3, "name": "Bulb 2", "ip": "192.168.2.26", "on": False, "brightness": 100, "color": "#ff0000"},
 }
+
+IPV4_RE = re.compile(r"^(\d{1,3})\.(\d{1,3})\.(\d{1,3})\.(\d{1,3})$")
+
+
+def _clean_ip(value):
+    """Validate a dotted-quad. Govee LAN control is IPv4-only, and a bad
+    address here would surface much later as a silent no-op."""
+    text = str(value or "").strip()
+    match = IPV4_RE.match(text)
+    if not match or any(int(part) > 255 for part in match.groups()):
+        raise ValueError(f"'{text}' is not a valid IPv4 address")
+    return text
+
+
+def _clean_device_name(value, fallback):
+    name = str(value or "").strip()
+    return name[:40] or fallback
+
+
+def _next_device_id():
+    used = set()
+    for key, bulb in bulbs.items():
+        try:
+            used.add(int(bulb.get("id", key)))
+        except (TypeError, ValueError):
+            continue
+    candidate = 2  # id 1 is reserved for the strip
+    while candidate in used:
+        candidate += 1
+    return candidate
 
 def load_bulbs():
     """Load from JSON file, or use defaults if file is missing/broken."""
@@ -142,11 +179,13 @@ def _bulb_monitor_loop():
 Thread(target=_bulb_monitor_loop, daemon=True).start()
 
 
-# --- 2b. Strip per-segment control (id=1 only) ----------------------------
-# The 45-pixel strip at 192.168.2.30 speaks the "razer" UDP protocol on port 4003.
+# --- 2b. Strip per-segment control (device id 1 only) ---------------------
+# The 45-pixel strip speaks the "razer" UDP protocol on port 4003. Its address
+# comes from bulb_state.json via _strip_ip(); STRIP_IP_FALLBACK is only used if
+# the strip entry somehow has no ip at all.
 # See engine/led_player.py + engine/led_patterns.py for the source of truth on
 # packet format and zone layout; the numbers here must stay in sync with them.
-STRIP_IP = "192.168.2.30"
+STRIP_IP_FALLBACK = "192.168.2.30"
 STRIP_PORT = 4003
 STRIP_PIXELS = 45
 # Inclusive [start, end] pixel indices per named zone.
@@ -218,7 +257,7 @@ def _enter_razer_mode():
     with strip_lock:
         if not _strip_razer_enabled:
             try:
-                strip_udp_sock.sendto(_razer_control_packet(True), (STRIP_IP, STRIP_PORT))
+                strip_udp_sock.sendto(_razer_control_packet(True), (_strip_ip(), STRIP_PORT))
             except OSError as e:
                 print(f"Strip razer-enable failed: {e}")
         _strip_razer_enabled = True
@@ -232,7 +271,7 @@ def _leave_razer_mode():
     with strip_lock:
         if _strip_razer_enabled:
             try:
-                strip_udp_sock.sendto(_razer_control_packet(False), (STRIP_IP, STRIP_PORT))
+                strip_udp_sock.sendto(_razer_control_packet(False), (_strip_ip(), STRIP_PORT))
             except OSError as e:
                 print(f"Strip razer-disable failed: {e}")
         _strip_razer_enabled = False
@@ -240,7 +279,7 @@ def _leave_razer_mode():
 
 
 def _strip_ip():
-    return (bulbs.get('1') or {}).get('ip') or STRIP_IP
+    return (bulbs.get(str(STRIP_DEVICE_ID)) or {}).get('ip') or STRIP_IP_FALLBACK
 
 
 def _govee_send_power(on):
@@ -298,7 +337,7 @@ def send_strip_frame(force_black=False):
                     buffer[i] = (r, g, b)
         _enter_razer_mode()
         try:
-            strip_udp_sock.sendto(_razer_frame_packet(buffer), (STRIP_IP, STRIP_PORT))
+            strip_udp_sock.sendto(_razer_frame_packet(buffer), (_strip_ip(), STRIP_PORT))
         except OSError as e:
             print(f"Strip UDP send failed: {e}")
     broadcast_strip_state()
@@ -571,8 +610,8 @@ def _timeline_devices():
             continue
         devices.append({
             "id": dev_id,
-            "name": bulb.get("name") or (f"Bulb {dev_id}" if dev_id != 1 else "Main Light"),
-            "kind": "strip" if dev_id == 1 else "bulb",
+            "name": bulb.get("name") or (f"Bulb {dev_id}" if dev_id != STRIP_DEVICE_ID else "Main Light"),
+            "kind": "strip" if dev_id == STRIP_DEVICE_ID else "bulb",
             "managed": True,
         })
     return sorted(devices, key=lambda d: d["id"])
@@ -672,7 +711,7 @@ def _clean_timeline_event(raw, index: int):
         "end_ms": end_ms,
     }
     # Bulbs are single points -- they carry no segments key at all.
-    if dev_id == 1:
+    if dev_id == STRIP_DEVICE_ID:
         cleaned["segments"] = _clean_segments(raw.get("segments", "all"), index)
     cleaned["color"] = _clean_rgb(raw.get("color", [255, 255, 255]), index)
     cleaned["params"] = params
@@ -725,10 +764,10 @@ def strip_apply_power(on):
 
 # --- 3. Helper Functions ---
 def update_hardware(bulb, action, value):
-    """Send commands to the physical device. id=1 is the LED strip; we drive
-    it primarily via govee LAN and only fall through to razer for genuine
-    per-zone segment work (see /api/bulbs/1/segments)."""
-    if bulb.get('id') == 1:
+    """Send commands to the physical device. The strip (id 1) is driven
+    primarily via govee LAN, falling through to razer only for genuine
+    per-zone segment work (see /api/bulbs/<strip>/segments)."""
+    if bulb.get('id') == STRIP_DEVICE_ID:
         global strip_brightness
         if action == "power":
             strip_apply_power(bool(value))
@@ -790,7 +829,7 @@ def handle_preflight():
 def add_cors_headers(response):
     response.headers['Access-Control-Allow-Origin'] = '*'
     response.headers['Access-Control-Allow-Headers'] = 'Content-Type'
-    response.headers['Access-Control-Allow-Methods'] = 'GET, POST, PUT, DELETE, OPTIONS'
+    response.headers['Access-Control-Allow-Methods'] = 'GET, POST, PUT, PATCH, DELETE, OPTIONS'
     return response
 
 
@@ -799,6 +838,87 @@ def add_cors_headers(response):
 def get_bulbs():
     # Return a list of all bulb dictionaries
     return jsonify(list(bulbs.values()))
+
+@app.route('/api/devices', methods=['POST', 'OPTIONS'])
+def add_device():
+    """Register a new bulb by IP. Everything else about it (colour,
+    brightness, on/off) starts at a sane default and is driven from the
+    normal bulb routes afterwards."""
+    payload = request.get_json(silent=True) or {}
+    try:
+        ip = _clean_ip(payload.get('ip'))
+    except ValueError as e:
+        return jsonify({'error': str(e)}), 400
+
+    for existing in bulbs.values():
+        if existing.get('ip') == ip:
+            return jsonify({'error': f"{existing.get('name') or 'A device'} already uses {ip}"}), 409
+
+    dev_id = _next_device_id()
+    device = {
+        'id': dev_id,
+        'name': _clean_device_name(payload.get('name'), f'Bulb {dev_id}'),
+        'ip': ip,
+        'on': False,
+        'brightness': 100,
+        'color': '#ff0000',
+        # Assume reachable until the monitor's next sweep says otherwise;
+        # starting offline would grey the new tile out for up to 12s.
+        'online': True,
+    }
+    bulbs[str(dev_id)] = device
+    save_bulbs()
+    print(f"[devices] added {dev_id} ({device['name']}) at {ip}")
+    socketio.emit('bulbs_state', list(bulbs.values()))
+    _monitor_wakeup.set()
+    return jsonify(device), 201
+
+
+@app.route('/api/devices/<int:device_id>', methods=['PATCH', 'PUT', 'DELETE', 'OPTIONS'])
+def edit_device(device_id):
+    device = bulbs.get(str(device_id))
+    if not device:
+        return jsonify({'error': 'Device not found'}), 404
+
+    if request.method == 'DELETE':
+        # The strip carries the per-zone razer logic; the app has no meaning
+        # without it, so it can be re-addressed but never removed.
+        if device_id == STRIP_DEVICE_ID:
+            return jsonify({'error': 'The LED strip cannot be removed'}), 400
+        _stop_music_if_linked(f'device {device_id} removed')
+        removed = bulbs.pop(str(device_id))
+        save_bulbs()
+        print(f"[devices] removed {device_id} ({removed.get('name')})")
+        socketio.emit('bulbs_state', list(bulbs.values()))
+        return jsonify({'removed': device_id})
+
+    payload = request.get_json(silent=True) or {}
+
+    if 'ip' in payload:
+        try:
+            ip = _clean_ip(payload.get('ip'))
+        except ValueError as e:
+            return jsonify({'error': str(e)}), 400
+        for key, existing in bulbs.items():
+            if key != str(device_id) and existing.get('ip') == ip:
+                return jsonify({'error': f"{existing.get('name') or 'A device'} already uses {ip}"}), 409
+        if ip != device.get('ip'):
+            device['ip'] = ip
+            # New address, unknown reachability -- let the monitor re-decide
+            # rather than carrying the old device's online flag over.
+            device['online'] = True
+            _monitor_wakeup.set()
+
+    if 'name' in payload:
+        device['name'] = _clean_device_name(
+            payload.get('name'),
+            'Main Light' if device_id == STRIP_DEVICE_ID else f'Bulb {device_id}',
+        )
+
+    save_bulbs()
+    socketio.emit('bulb_updated', device)
+    return jsonify(device)
+
 
 @app.route('/api/bulbs/<int:bulb_id>/toggle', methods=['POST', 'OPTIONS'])
 def toggle_bulb(bulb_id):
@@ -869,7 +989,9 @@ def set_bulb_color(bulb_id):
     
     return jsonify(bulb)
 
-@app.route('/api/bulbs/1/segments', methods=['GET', 'POST', 'OPTIONS'])
+# Registered under the strip's id rather than a literal 1, so the route
+# still lines up if STRIP_DEVICE_ID ever changes.
+@app.route(f'/api/bulbs/{STRIP_DEVICE_ID}/segments', methods=['GET', 'POST', 'OPTIONS'])
 def strip_segments():
     """GET  -> current per-zone color map + zone order.
     POST -> body { segments: ["All"] | ["Table", "Bed", ...], color: "#rrggbb" }
@@ -950,11 +1072,6 @@ def upload_music():
     if file is None or not file.filename:
         return jsonify({'error': 'no audio file provided'}), 400
 
-    include_bulbs = str(request.form.get('include_bulbs', 'true')).lower() == 'true'
-    segments_mode = str(request.form.get('segments_mode', 'mix')).lower()
-    if segments_mode not in ('all', 'zones', 'mix'):
-        segments_mode = 'mix'
-
     ext = Path(file.filename).suffix.lower()
     if ext not in AUDIO_EXTS:
         return jsonify({'error': f'unsupported extension {ext}'}), 400
@@ -977,18 +1094,9 @@ def upload_music():
         # the UI wants a distinct signal so it can window.alert() the user.
         pass
 
-    try:
-        _generate_timeline(audio_path, include_bulbs, segments_mode)
-    except Exception as e:
-        # Roll back audio + art so a broken track doesn't clutter the list.
-        for p in (audio_path, MUSIC_DIR / f"{base}.png"):
-            try:
-                if p.exists():
-                    p.unlink()
-            except Exception:
-                pass
-        return jsonify({'error': f'timeline generation failed: {e}'}), 500
-
+    # Upload stops here. The timeline is generated on demand from the effect
+    # editor, so a track lands in the library in seconds rather than after a
+    # full librosa analysis the user may not want.
     socketio.emit('music_library_updated', _list_music_tracks())
     return jsonify({
         'basename': base,
@@ -1041,8 +1149,10 @@ def music_timeline(basename):
     if request.method == 'GET':
         if _find_audio_file(safe) is None:
             return jsonify({'error': 'track not found'}), 404
+        # A track with no timeline yet opens as an empty one -- that's the
+        # state the editor offers its Generate button in.
         if not json_path.exists():
-            return jsonify({'error': 'no timeline JSON for this track'}), 404
+            return jsonify({'basename': safe, 'events': [], 'has_json': False})
         try:
             with open(json_path, 'r') as f:
                 data = json.load(f)
@@ -1051,14 +1161,13 @@ def music_timeline(basename):
         events = data['events'] if isinstance(data, dict) and 'events' in data else data
         if not isinstance(events, list):
             return jsonify({'error': 'timeline JSON is malformed'}), 500
-        return jsonify({'basename': safe, 'events': events})
+        return jsonify({'basename': safe, 'events': events, 'has_json': True})
 
     payload = request.get_json(silent=True)
     if payload is None:
         return jsonify({'error': 'expected a JSON body'}), 400
-    if not json_path.exists():
-        # Only ever overwrite a timeline the library already knows about.
-        return jsonify({'error': 'no timeline JSON for this track'}), 404
+    if _find_audio_file(safe) is None:
+        return jsonify({'error': 'track not found'}), 404
     try:
         timeline = _clean_timeline(payload)
     except ValueError as e:
@@ -1069,6 +1178,8 @@ def music_timeline(basename):
         return jsonify({'error': f'failed to write timeline: {e}'}), 500
 
     print(f"[timeline] saved {json_path.name} ({len(timeline['events'])} events)")
+    # A first save turns a JSON-less track into one the library shows as ready.
+    socketio.emit('music_library_updated', _list_music_tracks())
     with music_state.lock:
         live = music_state.basename == safe and music_state.process is not None
     return jsonify({
@@ -1077,6 +1188,42 @@ def music_timeline(basename):
         # The player loaded its copy at launch; a live song keeps the old one.
         'restart_required': live,
     })
+
+
+@app.route('/api/music/<basename>/generate', methods=['POST', 'OPTIONS'])
+def generate_music_timeline(basename):
+    """Run the librosa analysis for a track on demand. Slow (tens of seconds
+    on a long song), so the editor drives it from an explicit button rather
+    than making every upload wait for it."""
+    safe = _safe_basename(basename)
+    audio = _find_audio_file(safe)
+    if audio is None:
+        return jsonify({'error': 'track not found'}), 404
+
+    # Defaults mirror config.ts (DEFAULT_INCLUDE_BULBS / DEFAULT_SEGMENTS_MODE)
+    # so a request that omits them matches what the drawer shows. The UI always
+    # sends both explicitly.
+    payload = request.get_json(silent=True) or {}
+    include_bulbs = bool(payload.get('include_bulbs', False))
+    segments_mode = str(payload.get('segments_mode', 'all')).lower()
+    if segments_mode not in ('all', 'zones', 'mix'):
+        segments_mode = 'all'
+
+    try:
+        _generate_timeline(audio, include_bulbs, segments_mode)
+    except Exception as e:
+        return jsonify({'error': f'timeline generation failed: {e}'}), 500
+
+    json_path = MUSIC_DIR / f"{safe}.json"
+    try:
+        with open(json_path, 'r') as f:
+            data = json.load(f)
+    except Exception as e:
+        return jsonify({'error': f'generated timeline could not be read: {e}'}), 500
+
+    socketio.emit('music_library_updated', _list_music_tracks())
+    events = data.get('events', []) if isinstance(data, dict) else data
+    return jsonify({'basename': safe, 'events': events, 'has_json': True})
 
 
 @app.route('/api/music/<basename>/play', methods=['POST', 'OPTIONS'])
@@ -1256,6 +1403,38 @@ def delete_music(basename):
     return jsonify({'removed': removed})
 
 
+# --- 5b. Serve the built frontend ----------------------------------------
+# With `front-end/dist` present this is the whole app on one port: no second
+# vite process, and the UI talks to whatever host served it (see the PROD
+# branch in front-end/src/config.ts), so there is no IP to hardcode.
+# `npm run dev` is still the way to work on the frontend.
+FRONTEND_DIST = PROJECT_ROOT / 'front-end' / 'dist'
+
+
+@app.route('/', methods=['GET'])
+def serve_index():
+    index = FRONTEND_DIST / 'index.html'
+    if not index.exists():
+        return (
+            "<h1>Frontend not built</h1>"
+            "<p>Run <code>./start.sh</code>, or build it manually with "
+            "<code>cd front-end && npm install && npm run build</code>.</p>",
+            503,
+        )
+    return send_from_directory(str(FRONTEND_DIST), 'index.html')
+
+
+@app.route('/<path:asset_path>', methods=['GET'])
+def serve_asset(asset_path):
+    """Static files out of dist, falling back to index.html so a deep link
+    still boots the app. Registered last, so it can never shadow /api/*."""
+    candidate = (FRONTEND_DIST / asset_path).resolve()
+    # Keep '..' from escaping dist.
+    if candidate.is_file() and candidate.is_relative_to(FRONTEND_DIST.resolve()):
+        return send_from_directory(str(FRONTEND_DIST), asset_path)
+    return serve_index()
+
+
 @app.route('/health', methods=['GET'])
 def health():
     return jsonify({'status': 'ok'})
@@ -1286,4 +1465,11 @@ def handle_disconnect():
 
 
 if __name__ == '__main__':
-    socketio.run(app, host='0.0.0.0', port=8080, debug=False)
+    # PORT lets a second instance run alongside the usual one (handy for
+    # testing); start.sh passes whatever it advertised to the user.
+    port = int(os.environ.get('PORT', 8080))
+    print(f"Serving the UI and API on http://0.0.0.0:{port}")
+    if not FRONTEND_DIST.exists():
+        print("Frontend not built yet -- run ./start.sh to build and serve it.")
+    socketio.run(app, host='0.0.0.0', port=port, debug=False,
+                 allow_unsafe_werkzeug=True)

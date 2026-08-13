@@ -5,10 +5,11 @@ import {
   Box,
   Chip,
   CssBaseline,
+  IconButton,
   Stack,
   Typography,
 } from '@mui/material'
-import { LibraryMusicOutlined } from '@mui/icons-material'
+import { LibraryMusicOutlined, LightbulbOutlineRounded } from '@mui/icons-material'
 import { useMediaQuery } from '@mui/material'
 import { ThemeProvider, createTheme } from '@mui/material/styles'
 import { io, Socket } from 'socket.io-client'
@@ -18,7 +19,8 @@ import { routineData } from './RoutineData'
 import RoutineTile from './RoutineTile'
 import MusicTile, { type MusicTrack } from './MusicTile'
 import LibraryDrawer from './LibraryDrawer'
-import { API_BASE_URL } from './config'
+import DeviceDrawer from './DeviceDrawer'
+import { API_BASE_URL, LS_LINK_TO_LIGHTS, readLinkToLights } from './config'
 
 export type Bulb = {
   id?: number
@@ -91,11 +93,10 @@ function App() {
   const [musicTracks, setMusicTracks] = useState<MusicTrack[]>([])
   const [musicState, setMusicState] = useState<MusicState>({ playing: null, linked: false })
   const [libraryOpen, setLibraryOpen] = useState(false)
-  const [linkToLights, setLinkToLights] = useState<boolean>(() => {
-    return localStorage.getItem('library.linkToLights') === 'true'
-  })
+  const [devicesOpen, setDevicesOpen] = useState(false)
+  const [linkToLights, setLinkToLights] = useState<boolean>(readLinkToLights)
   useEffect(() => {
-    localStorage.setItem('library.linkToLights', linkToLights ? 'true' : 'false')
+    localStorage.setItem(LS_LINK_TO_LIGHTS, linkToLights ? 'true' : 'false')
   }, [linkToLights])
 
   const selectedBulb = bulbs.find((bulb) => bulb.id === selectedBulbId) ?? bulbs[0]
@@ -239,6 +240,17 @@ function App() {
     void postBulbCommand(bulbId, 'color', { color })
   }
 
+  const refreshBulbs = async () => {
+    try {
+      const res = await fetch(`${API_BASE_URL}/api/bulbs`)
+      if (!res.ok) return
+      const data = await res.json()
+      if (Array.isArray(data)) setBulbs(data)
+    } catch {
+      // Socket broadcasts will resync shortly.
+    }
+  }
+
   const refreshMusicLibrary = async () => {
     try {
       const res = await fetch(`${API_BASE_URL}/api/music`)
@@ -353,15 +365,34 @@ function App() {
               </Typography>
             </Stack>
 
-            <Stack direction="row" spacing={1} sx={{ flexWrap: 'wrap', justifyContent: 'flex-end' }}>
+            <Stack
+              direction="row"
+              spacing={1}
+              sx={{ alignItems: 'center', flexWrap: 'wrap', justifyContent: 'flex-end' }}
+            >
               <Chip
                 label={`${activeBulbs} active`}
                 sx={{
+                  // Matches the icon button beside it (and the Music chip).
+                  height: 38,
                   backgroundColor: alpha('#ffffff', 0.06),
                   color: 'text.primary',
                   border: '1px solid rgba(255,255,255,0.08)',
+                  borderRadius: "1.5rem",
                 }}
               />
+              <IconButton
+                aria-label="Manage devices"
+                onClick={() => setDevicesOpen(true)}
+                sx={{
+                  color: 'text.secondary',
+                  border: '1px solid rgba(255,255,255,0.08)',
+                  backgroundColor: alpha('#ffffff', 0.06),
+                  ':hover': { color: 'text.primary', borderColor: 'rgba(255,255,255,0.2)' },
+                }}
+              >
+                <LightbulbOutlineRounded fontSize="small" />
+              </IconButton>
             </Stack>
           </Stack>
 
@@ -382,6 +413,13 @@ function App() {
             ))}
           </Stack>
         </Stack>
+        <DeviceDrawer
+          open={devicesOpen}
+          isPhone={isPhone}
+          devices={bulbs}
+          onClose={() => setDevicesOpen(false)}
+          onDevicesChanged={() => void refreshBulbs()}
+        />
         <BulbDrawer
           open={drawerOpen}
           isPhone={isPhone}

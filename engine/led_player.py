@@ -23,18 +23,23 @@ from typing import List, Optional
 import pygame
 
 from audio_analyzer import AudioAnalyzer
+import devices
 from bulb_controller import BulbController, color_to_bulb
 from led_patterns import PATTERNS, PatternContext, resolve_segments
 
-# JSON events default to id=1 (the LED strip). Bulbs are ids 2..5.
-STRIP_ID = 1
-BULB_IDS = (2, 3, 4, 5)
+# JSON events default to the strip's id; every other configured device is a
+# bulb. Both come from bulb_state.json, which the Devices drawer edits.
+STRIP_ID = devices.STRIP_DEVICE_ID
+BULB_IDS = tuple(devices.bulb_ids())
 
 # --- Strip / network config -------------------------------------------------
-IP = "192.168.2.30"
-PORT = 4003
-PIXELS = 45
+IP = devices.strip_ip()
+PORT = devices.STRIP_PORT
+PIXELS = devices.STRIP_PIXELS
 FPS = 30
+# The generated onset boxes are consistently late relative to audible output
+# on this mixer/device path. Advance the lighting clock by 150 ms.
+AUDIO_OUTPUT_LATENCY_MS = -150
 
 # Razer mode times out unless the strip keeps hearing from us, and an all-zero
 # frame doesn't appear to count as activity -- which is why gaps in a timeline
@@ -104,13 +109,50 @@ def find_active_event(events: List[dict], elapsed_ms: float) -> Optional[dict]:
     return active
 
 
+def find_active_events(events: List[dict], elapsed_ms: float) -> List[dict]:
+    """Return all events active at a timestamp, preserving timeline order."""
+    return [
+        event for event in events
+        if event["start_ms"] <= elapsed_ms < event["end_ms"]
+    ]
+
+
+def _render_event(buffer, event, elapsed_ms, audio_analyzer, frame_index):
+    segments = resolve_segments(event.get("segments", "all"), len(buffer))
+    color = tuple(event.get("color", [255, 255, 255]))
+    params = event.get("params", {})
+    duration_ms = max(1, event["end_ms"] - event["start_ms"])
+    t_ms = elapsed_ms - event["start_ms"]
+    progress = max(0.0, min(1.0, t_ms / duration_ms))
+    context = PatternContext(
+        segments=segments,
+        color=color,
+        params=params,
+        t_ms=t_ms,
+        duration_ms=duration_ms,
+        progress=progress,
+        now_ms=elapsed_ms,
+        audio=audio_analyzer,
+        frame_index=frame_index,
+    )
+    pattern_fn = PATTERNS.get(event["pattern"])
+    if pattern_fn is None:
+        print(f"Warning: unknown pattern '{event['pattern']}'")
+        return
+    rendered = [(0, 0, 0)] * len(buffer)
+    pattern_fn(rendered, context)
+    for index, value in enumerate(rendered):
+        buffer[index] = tuple(max(buffer[index][channel], value[channel]) for channel in range(3))
+
+
 def needs_audio_analysis(events: List[dict]) -> bool:
     return any(e.get("pattern") == "audio_spectrum" for e in events)
 
 
 # --- Main render loop ---------------------------------------------------------
 
-def render_timeline(events: List[dict], audio_analyzer, elapsed_ms_fn, is_running_fn):
+def render_timeline(events: List[dict], audio_analyzer, elapsed_ms_fn, is_running_fn,
+                    clock_latency_ms: float = 0):
     """Drive the strip + bulbs from a timeline until is_running_fn() goes False.
 
     The clock is injected: led_player feeds it pygame's audio position, while
@@ -135,55 +177,41 @@ def render_timeline(events: List[dict], audio_analyzer, elapsed_ms_fn, is_runnin
     frame_index = 0
     next_tick = time.perf_counter()
     next_keepalive = next_tick + RAZER_KEEPALIVE_SEC
-    last_event_id = None
+    last_event_ids = None
     last_bulb_event_id: dict = {bid: None for bid in BULB_IDS}
 
     try:
         while is_running_fn():
-            elapsed_ms = elapsed_ms_fn()
+            elapsed_ms = elapsed_ms_fn() + clock_latency_ms
             if elapsed_ms < 0:
                 elapsed_ms = 0
 
             buffer = [(0, 0, 0)] * PIXELS
-            event = find_active_event(strip_events, elapsed_ms)
-
-            event_id = id(event) if event is not None else None
-            if event_id != last_event_id:
-                last_event_id = event_id
-                if event is not None:
-                    segs_preview = event.get("segments", "all")
+            active_events = find_active_events(strip_events, elapsed_ms)
+            event_ids = tuple(id(event) for event in active_events)
+            if event_ids != last_event_ids:
+                last_event_ids = event_ids
+                if active_events:
                     print(
-                        f"[{elapsed_ms/1000:6.2f}s] pattern='{event['pattern']}' "
-                        f"segments={segs_preview} color={event.get('color')}"
+                        f"[{elapsed_ms/1000:6.2f}s] "
+                        + ", ".join(
+                            f"{event['pattern']}[{event.get('layer', 'base')}]"
+                            for event in active_events
+                        )
                     )
                 else:
                     print(f"[{elapsed_ms/1000:6.2f}s] (no active event -- strip off)")
 
-            if event is not None:
-                segments = resolve_segments(event.get("segments", "all"), PIXELS)
-                color = tuple(event.get("color", [255, 255, 255]))
-                params = event.get("params", {})
-                duration_ms = max(1, event["end_ms"] - event["start_ms"])
-                t_ms = elapsed_ms - event["start_ms"]
-                progress = max(0.0, min(1.0, t_ms / duration_ms))
-
-                ctx = PatternContext(
-                    segments=segments,
-                    color=color,
-                    params=params,
-                    t_ms=t_ms,
-                    duration_ms=duration_ms,
-                    progress=progress,
-                    now_ms=elapsed_ms,
-                    audio=audio_analyzer,
-                    frame_index=frame_index,
-                )
-
-                pattern_fn = PATTERNS.get(event["pattern"])
-                if pattern_fn is not None:
-                    pattern_fn(buffer, ctx)
-                else:
-                    print(f"Warning: unknown pattern '{event['pattern']}'")
+            base_events = [
+                event for event in active_events
+                if event.get("layer", "base") != "accent"
+            ]
+            accent_events = [
+                event for event in active_events
+                if event.get("layer", "base") == "accent"
+            ]
+            for event in base_events + accent_events:
+                _render_event(buffer, event, elapsed_ms, audio_analyzer, frame_index)
 
             # IDLE_LEVEL 0 sends the buffer untouched; raising it swaps a fully
             # dark frame -- a gap, or an event that paints nothing this tick --
@@ -280,6 +308,7 @@ def run(song_path: str, json_path: Optional[str] = None):
             # ms since play() was called
             elapsed_ms_fn=pygame.mixer.music.get_pos,
             is_running_fn=pygame.mixer.music.get_busy,
+            clock_latency_ms=AUDIO_OUTPUT_LATENCY_MS,
         )
     finally:
         pygame.mixer.music.stop()

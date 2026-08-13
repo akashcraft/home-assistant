@@ -1,0 +1,36 @@
+# Runs Home Lights on boot, so the Pi serves the UI without anyone logging in.
+#
+# Install (adjust User and the paths to match your box):
+#     sudo cp deploy/home-lights.service /etc/systemd/system/
+#     sudo systemctl daemon-reload
+#     sudo systemctl enable --now home-lights
+#
+# Then:
+#     systemctl status home-lights     # is it up?
+#     journalctl -u home-lights -f     # follow the log
+#     sudo systemctl restart home-lights
+#
+[Unit]
+Description=Home Lights
+# Govee LAN control needs the network, and the timestamped music engine
+# behaves better once the clock is set.
+After=network-online.target
+Wants=network-online.target
+
+[Service]
+Type=simple
+User=orangepi
+WorkingDirectory=/home/orangepi/home-assistant
+# --no-build: the Pi is slow, so build on your laptop and copy front-end/dist
+# across, or drop the flag to let it build here on first boot.
+ExecStart=/home/orangepi/home-assistant/start.sh --no-build
+Environment=PORT=8080
+Restart=on-failure
+RestartSec=5
+# The engine spawns pygame/librosa subprocesses; give them room to exit
+# cleanly so bulbs get restored to their pre-show state.
+KillMode=mixed
+TimeoutStopSec=20
+
+[Install]
+WantedBy=multi-user.target
